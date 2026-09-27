@@ -595,6 +595,12 @@ class GatewaySlashCommandsMixin(
         """Handle /version — show the running Hermes Agent version."""
         return _execute("version").text
 
+    async def _handle_takeover_command(self, event: MessageEvent) -> str:
+        """Handle /takeover — report open board work without changing any task."""
+        from hermes_cli.takeover import format_takeover, takeover_inventory
+
+        return format_takeover(await asyncio.to_thread(takeover_inventory))
+
     def _catalog_options(self, event: MessageEvent) -> dict:
         """``allowed_commands`` for /help and /commands when the caller is a gated non-admin:
         the slash-access floor + ``user_allowed_commands`` (mirrors /whoami), so the catalog
