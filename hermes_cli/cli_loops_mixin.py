@@ -227,6 +227,12 @@ class CLILoopsMixin:
         from hermes_cli.main import _print_version_info
         _print_version_info(check_updates=True)
 
+    def _handle_takeover_command(self, cmd_original: str):
+        """Print the read-only board inventory. The command changes no task."""
+        from hermes_cli.takeover import format_takeover, takeover_inventory
+
+        print(format_takeover(takeover_inventory()))
+
     def _cmd_reload(self, cmd_original: str):
         from hermes_cli.config import reload_env
         count = reload_env()
