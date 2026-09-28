@@ -34,7 +34,7 @@ def check(name, ok, detail=""):
 
 
 def caller_uid() -> int:
-    return os.getuid()
+    return os.getuid() if hasattr(os, "getuid") else 0
 
 
 def other_uid() -> int:

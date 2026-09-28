@@ -71,7 +71,7 @@ class Broker:
 
     def open(self) -> bool:
         try:
-            text = self.marker_path.read_text(encoding="utf-8")
+            text = self.marker_path.read_text(encoding="utf-8-sig")
         except OSError:
             return False
         return text.strip() == "open"

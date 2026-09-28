@@ -83,7 +83,7 @@ def main() -> int:
 
     # The three direct scripts import the guard and claim before any request.
     for name in ("bot-claim.py", "tg_slack_bridge.py", "slack-broadcast-test.py"):
-        text = (HERE / name).read_text(encoding="utf-8")
+        text = (HERE / name).read_text(encoding="utf-8-sig")
         claim_at = text.find("egress_claim(")
         net_at = min(
             (i for i in (text.find("urlopen"), text.find("curl")) if i >= 0),

@@ -45,7 +45,6 @@ Exit: 0 alles goed, 1 groepsbericht mislukt, 2 wel gepost maar een peer faalde.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -146,7 +145,7 @@ def profiel_van(home: str | None = None) -> str:
             for vlag in ("-p", "--profile"):
                 if vlag in cmd and cmd.index(vlag) + 1 < len(cmd):
                     return cmd[cmd.index(vlag) + 1]
-            stat = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[-1].split()
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8-sig").rsplit(") ", 1)[-1].split()
             pid = int(stat[1])
             if pid <= 1:
                 break
@@ -173,7 +172,7 @@ def _ouder_pids(pid: int | None = None) -> list[int]:
         try:
             stat = Path(f"/proc/{huidig}/stat")
             if stat.exists():
-                velden = stat.read_text().rsplit(") ", 1)[-1].split()
+                velden = stat.read_text(encoding="utf-8-sig").rsplit(") ", 1)[-1].split()
                 ouder = int(velden[1])
             else:
                 raw = subprocess.run(
@@ -407,7 +406,7 @@ def ledger_lees(pad: Path) -> dict:
     if not pad.is_file():
         return {}
     try:
-        return json.loads(pad.read_text())
+        return json.loads(pad.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, OSError):
         return {}
 
@@ -422,6 +421,7 @@ def ledger_lock(pad: Path):
     """
     slot = pad.with_suffix(pad.suffix + ".lock")
     slot.parent.mkdir(parents=True, exist_ok=True)
+    import fcntl
     with slot.open("a+") as fh:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         try:
@@ -498,7 +498,7 @@ def bot_token() -> str:
     home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
     env = home / ".env"
     if env.exists():
-        m = re.search(r"^TELEGRAM_BOT_TOKEN=(\S+)", env.read_text(), re.M)
+        m = re.search(r"^TELEGRAM_BOT_TOKEN=(\S+)", env.read_text(encoding="utf-8-sig"), re.M)
         if m:
             return m.group(1).strip("\"'")
     raise SystemExit("FOUT: TELEGRAM_BOT_TOKEN niet in de omgeving of .env")
@@ -524,7 +524,7 @@ def slack_token(home: str | None = None, profiel: str | None = None) -> str:
     kandidaten.append(basis / ".env")
     for env in kandidaten:
         if env.exists():
-            m = re.search(r"^SLACK_BOT_TOKEN=(\S+)", env.read_text(), re.M)
+            m = re.search(r"^SLACK_BOT_TOKEN=(\S+)", env.read_text(encoding="utf-8-sig"), re.M)
             if m:
                 return m.group(1).strip("\"'")
     if token:

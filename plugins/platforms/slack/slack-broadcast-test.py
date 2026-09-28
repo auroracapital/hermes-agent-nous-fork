@@ -45,7 +45,7 @@ def main():
         print("geweigerd:", exc)
         return 1
 
-    toks = json.load(open(TOK))
+    toks = json.load(open(TOK, encoding="utf-8-sig"))
     tok = toks["Hermes"]["bot_token"]
     env = subprocess.run(
         ["bash", "-c", ". /home/ubuntu/.cache/shell/env-exports.sh; "

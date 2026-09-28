@@ -27,7 +27,7 @@ def env_token(name, home=None):
                  Path.home() / ".hermes" / ".env"):
         try:
             if cand.exists():
-                for line in cand.read_text(errors="replace").splitlines():
+                for line in cand.read_text(encoding="utf-8-sig", errors="replace").splitlines():
                     if line.startswith(f"{name}="):
                         v = line.split("=", 1)[1].strip().strip('"').strip("'")
                         if v:
@@ -43,7 +43,7 @@ def bot_cfg(home):
     p = Path(home) / "config.yaml"
     if not p.exists():
         return {}
-    return yaml.safe_load(p.read_text()) or {}
+    return yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
 
 
 class SlackClient:
