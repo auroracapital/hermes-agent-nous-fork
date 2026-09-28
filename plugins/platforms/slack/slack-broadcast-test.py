@@ -25,16 +25,7 @@ NAMES = {
 
 
 def main():
-    toks = json.load(open(TOK))
-    tok = toks["Hermes"]["bot_token"]
     token = sys.argv[1] if len(sys.argv) > 1 else "channel"
-
-    # chat.postMessage is NOT the surface Sam uses. Slack only allows @everyone
-    # in the general channel; in #bots his client refuses with "The use of
-    # @everyone has been restricted, so your message can't be sent" (measured
-    # 2026-09-07 15:24 UTC). The API has no such restriction, so this test
-    # returned a green PASS for a token Sam physically cannot send. Refuse it
-    # instead of manufacturing that false proof.
     if token == "everyone":
         print("REFUSED: @everyone werkt in Slack alleen in #general, niet in "
               "#bots. chat.postMessage omzeilt die clientbeperking, dus een "
@@ -42,15 +33,9 @@ def main():
               "Test @channel of @here.")
         return 2
 
-    # Post AS SAM, not as a bot. A bot-authored broadcast is subject to the
-    # bot->bot hop budget, so testing with a bot token measures the wrong thing.
-    env = subprocess.run(
-        ["bash", "-c", ". /home/ubuntu/.cache/shell/env-exports.sh; "
-         "echo $SLACK_MCP_XOXC_TOKEN; echo $SLACK_MCP_XOXD_TOKEN"],
-        capture_output=True, text=True, check=True).stdout.split()
-    xoxc, xoxd = env[0], env[1]
-
-    marker = f"BROADCASTTEST-{token}-{int(time.time())}"
+    # Refuse before any token is read and before any request is built. A
+    # missing file or a slow lookup must not be able to run ahead of the deny.
+    marker = f"BROADCASTTEST-{token}"
     from plugins.platforms.slack.egress_guard import EgressDenied, claim as egress_claim
     try:
         egress_claim(account=CH, channel=CH, text=marker,
@@ -59,6 +44,14 @@ def main():
     except EgressDenied as exc:
         print("geweigerd:", exc)
         return 1
+
+    toks = json.load(open(TOK))
+    tok = toks["Hermes"]["bot_token"]
+    env = subprocess.run(
+        ["bash", "-c", ". /home/ubuntu/.cache/shell/env-exports.sh; "
+         "echo $SLACK_MCP_XOXC_TOKEN; echo $SLACK_MCP_XOXD_TOKEN"],
+        capture_output=True, text=True, check=True).stdout.split()
+    xoxc, xoxd = env[0], env[1]
     r = subprocess.run(
         ["curl", "-s", "--max-time", "20", "-X", "POST",
          "https://slack.com/api/chat.postMessage",
