@@ -1,16 +1,19 @@
-"""Slack egress guard. One claim before any network effect.
+"""Slack egress guard. The caller holds no authority to approve itself.
 
-Fail closed. A missing, unreadable, empty or non-open stop marker denies.
-An exact approved row (account, channel, text, attachment) is required
-before the insert. A unique key plus BEGIN IMMEDIATE makes two processes
-race to one insert. A crash after the effect leaves the row uncertain, and
-uncertain never replays by itself.
+A write reaches the network only after a claim that a separate broker
+process accepted. The broker runs as a different operating-system user,
+owns the grants database and the stop marker, and checks the peer identity
+of every request. This module never opens that database and never records
+a grant.
+
+Default is deny. No broker, a refused peer, a missing grant, a consumed
+grant or a closed marker all raise EgressDenied before any network effect.
 """
 from __future__ import annotations
 
-import hashlib
+import json
 import os
-import sqlite3
+import socket
 from pathlib import Path
 
 READ_ALLOW = frozenset({
@@ -21,92 +24,6 @@ READ_ALLOW = frozenset({
     "channels_list",
 })
 
-
-class EgressDenied(Exception):
-    """Raised when a Slack write must not reach the network."""
-
-
-def _home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
-
-
-def db_path() -> Path:
-    override = os.environ.get("SLACK_EGRESS_DB")
-    if override:
-        return Path(override)
-    return _home() / "state" / "slack-egress.sqlite"
-
-
-def marker_path() -> Path:
-    override = os.environ.get("SLACK_ESTOP_PATH")
-    if override:
-        return Path(override)
-    return _home() / "state" / "slack-estop"
-
-
-def marker_open() -> bool:
-    """Only the exact word 'open' allows a claim. Anything else denies."""
-    path = marker_path()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    return text.strip() == "open"
-
-
-def fingerprint(account: str, channel: str, text: str, attachment: str) -> str:
-    raw = "\n".join([account or "", channel or "", text or "", attachment or ""])
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _connect() -> sqlite3.Connection:
-    path = db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(path), timeout=5, isolation_level=None)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute(
-        """CREATE TABLE IF NOT EXISTS claims (
-            fp TEXT PRIMARY KEY,
-            account TEXT NOT NULL,
-            channel TEXT NOT NULL,
-            body TEXT NOT NULL,
-            attachment TEXT NOT NULL,
-            approved INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
-        )"""
-    )
-    con.execute(
-        """CREATE TABLE IF NOT EXISTS grants (
-            fp TEXT PRIMARY KEY,
-            account TEXT NOT NULL,
-            channel TEXT NOT NULL,
-            body TEXT NOT NULL,
-            attachment TEXT NOT NULL,
-            consumed INTEGER NOT NULL DEFAULT 0
-        )"""
-    )
-    return con
-
-
-def grant(account: str, channel: str, text: str, attachment: str = "") -> str:
-    """Record one exact approval before any send. Tests and a human gate call
-    this. A caller of claim cannot."""
-    fp = fingerprint(account, channel, text, attachment or "")
-    con = _connect()
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        con.execute(
-            "INSERT OR IGNORE INTO grants (fp, account, channel, body, attachment) "
-            "VALUES (?,?,?,?,?)",
-            (fp, account, channel, text, attachment or ""),
-        )
-        con.execute("COMMIT")
-    finally:
-        con.close()
-    return fp
-
-
 WRITE_KNOWN = frozenset({
     "chat.postMessage",
     "chat.update",
@@ -116,8 +33,26 @@ WRITE_KNOWN = frozenset({
 })
 
 
+class EgressDenied(Exception):
+    """Raised when a Slack write must not reach the network."""
+
+
+def broker_socket() -> Path:
+    """Where the broker listens. The caller cannot choose the database.
+
+    SLACK_EGRESS_DB and SLACK_ESTOP_PATH used to let the caller point the
+    guard at a file it owns. Both are ignored on purpose. The socket path is
+    the only locator, and it names a socket the broker owns, not a database.
+    """
+    override = os.environ.get("SLACK_EGRESS_BROKER_SOCK")
+    if override:
+        return Path(override)
+    home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    return home / "state" / "slack-egress-broker" / "broker.sock"
+
+
 def classify(tool_name: str) -> str:
-    """Return 'read' or 'deny'. Only the read list passes; every other name denies."""
+    """Return 'read', 'write' or 'deny'. Only the read list passes locally."""
     name = (tool_name or "").strip()
     if name in READ_ALLOW:
         return "read"
@@ -126,73 +61,77 @@ def classify(tool_name: str) -> str:
     return "deny"
 
 
+def _ask(request: dict) -> dict:
+    path = broker_socket()
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect(str(path))
+        sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        raw = b""
+        while b"\n" not in raw and len(raw) < 65536:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+    except OSError as exc:
+        raise EgressDenied(f"broker unreachable: {exc}") from exc
+    finally:
+        if sock is not None:
+            sock.close()
+    try:
+        reply = json.loads(raw.decode("utf-8").strip() or "{}")
+    except json.JSONDecodeError as exc:
+        raise EgressDenied("broker reply unreadable") from exc
+    if not reply.get("ok"):
+        raise EgressDenied(str(reply.get("error") or "broker denied"))
+    return reply
+
+
+def grant(account: str, channel: str, text: str, attachment: str = "") -> str:
+    """Ask the broker to record one approval.
+
+    The broker refuses this from the caller's own uid. A caller that imports
+    and calls grant() gets a denial, never a usable approval.
+    """
+    reply = _ask({
+        "op": "grant",
+        "account": account,
+        "channel": channel,
+        "text": text,
+        "attachment": attachment or "",
+    })
+    return str(reply.get("fp") or "")
+
+
 def claim(account: str, channel: str, text: str, attachment: str = "",
           approved: bool = False, tool_name: str = "chat.postMessage") -> str:
-    """Insert one exclusive claim. Raises EgressDenied on every refusal.
+    """Ask the broker to consume one exact grant. Raises EgressDenied otherwise.
 
-    The approved flag is ignored. Permission comes only from a pre-recorded
-    grant for this exact account, channel, text and attachment, consumed once
-    inside the same transaction as the insert. A caller cannot grant itself.
+    The approved flag is ignored. A read on the allowlist returns without
+    touching the broker, because a read has no network effect to guard.
     """
-    del approved  # caller-supplied; never trusted
-    if classify(tool_name) == "read":
+    del approved
+    kind = classify(tool_name)
+    if kind == "read":
         return "read"
-    if classify(tool_name) != "write":
+    if kind != "write":
         raise EgressDenied(f"unknown tool {tool_name}")
-    if not marker_open():
-        raise EgressDenied("stop marker missing, unreadable, empty or not open")
-    if not account or not channel or text is None:
-        raise EgressDenied("account, channel and text are required")
-    fp = fingerprint(account, channel, text, attachment or "")
-    con = _connect()
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        grant_row = con.execute(
-            "SELECT consumed FROM grants WHERE fp=?", (fp,)
-        ).fetchone()
-        if grant_row is None:
-            con.execute("ROLLBACK")
-            raise EgressDenied("no pre-recorded grant for this exact text")
-        if grant_row[0]:
-            con.execute("ROLLBACK")
-            raise EgressDenied("grant already consumed")
-        existing = con.execute("SELECT status FROM claims WHERE fp=?", (fp,)).fetchone()
-        if existing is not None:
-            con.execute("ROLLBACK")
-            raise EgressDenied(f"already {existing[0]}")
-        cur = con.execute(
-            "UPDATE grants SET consumed=1 WHERE fp=? AND consumed=0", (fp,)
-        )
-        if cur.rowcount != 1:
-            con.execute("ROLLBACK")
-            raise EgressDenied("grant lost the race")
-        con.execute(
-            "INSERT INTO claims (fp, account, channel, body, attachment, approved, status) "
-            "VALUES (?,?,?,?,?,1,'claimed')",
-            (fp, account, channel, text, attachment or ""),
-        )
-        con.execute("COMMIT")
-    except EgressDenied:
-        raise
-    except sqlite3.Error as exc:
-        try:
-            con.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
-        raise EgressDenied(f"claim failed: {exc}") from exc
-    finally:
-        con.close()
-    return fp
+    reply = _ask({
+        "op": "claim",
+        "account": account,
+        "channel": channel,
+        "text": text,
+        "attachment": attachment or "",
+        "tool": tool_name,
+    })
+    return str(reply.get("fp") or "")
 
 
 def mark(fp: str, status: str) -> None:
-    """Record the outcome. 'uncertain' is terminal: it never auto-replays."""
+    """Kept for the adapter. The broker already consumed the grant at claim,
+    so a crash after the effect cannot be replayed. Nothing here re-opens it."""
+    del fp
     if status not in {"sent", "uncertain", "denied"}:
         raise EgressDenied(f"unknown status {status}")
-    con = _connect()
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        con.execute("UPDATE claims SET status=? WHERE fp=? AND status='claimed'", (status, fp))
-        con.execute("COMMIT")
-    finally:
-        con.close()
