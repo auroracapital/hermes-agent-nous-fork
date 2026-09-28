@@ -76,7 +76,35 @@ def _connect() -> sqlite3.Connection:
             created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
         )"""
     )
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS grants (
+            fp TEXT PRIMARY KEY,
+            account TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            body TEXT NOT NULL,
+            attachment TEXT NOT NULL,
+            consumed INTEGER NOT NULL DEFAULT 0
+        )"""
+    )
     return con
+
+
+def grant(account: str, channel: str, text: str, attachment: str = "") -> str:
+    """Record one exact approval before any send. Tests and a human gate call
+    this. A caller of claim cannot."""
+    fp = fingerprint(account, channel, text, attachment or "")
+    con = _connect()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute(
+            "INSERT OR IGNORE INTO grants (fp, account, channel, body, attachment) "
+            "VALUES (?,?,?,?,?)",
+            (fp, account, channel, text, attachment or ""),
+        )
+        con.execute("COMMIT")
+    finally:
+        con.close()
+    return fp
 
 
 WRITE_KNOWN = frozenset({
@@ -102,28 +130,42 @@ def claim(account: str, channel: str, text: str, attachment: str = "",
           approved: bool = False, tool_name: str = "chat.postMessage") -> str:
     """Insert one exclusive claim. Raises EgressDenied on every refusal.
 
-    The caller must invoke this before the network call. A successful return
-    is the only permission to send. The row stays 'claimed' until the caller
-    reports the outcome.
+    The approved flag is ignored. Permission comes only from a pre-recorded
+    grant for this exact account, channel, text and attachment, consumed once
+    inside the same transaction as the insert. A caller cannot grant itself.
     """
+    del approved  # caller-supplied; never trusted
     if classify(tool_name) == "read":
         return "read"
     if classify(tool_name) != "write":
         raise EgressDenied(f"unknown tool {tool_name}")
     if not marker_open():
         raise EgressDenied("stop marker missing, unreadable, empty or not open")
-    if not approved:
-        raise EgressDenied("exact approval missing")
     if not account or not channel or text is None:
         raise EgressDenied("account, channel and text are required")
     fp = fingerprint(account, channel, text, attachment or "")
     con = _connect()
     try:
         con.execute("BEGIN IMMEDIATE")
-        row = con.execute("SELECT status FROM claims WHERE fp=?", (fp,)).fetchone()
-        if row is not None:
+        grant_row = con.execute(
+            "SELECT consumed FROM grants WHERE fp=?", (fp,)
+        ).fetchone()
+        if grant_row is None:
             con.execute("ROLLBACK")
-            raise EgressDenied(f"already {row[0]}")
+            raise EgressDenied("no pre-recorded grant for this exact text")
+        if grant_row[0]:
+            con.execute("ROLLBACK")
+            raise EgressDenied("grant already consumed")
+        existing = con.execute("SELECT status FROM claims WHERE fp=?", (fp,)).fetchone()
+        if existing is not None:
+            con.execute("ROLLBACK")
+            raise EgressDenied(f"already {existing[0]}")
+        cur = con.execute(
+            "UPDATE grants SET consumed=1 WHERE fp=? AND consumed=0", (fp,)
+        )
+        if cur.rowcount != 1:
+            con.execute("ROLLBACK")
+            raise EgressDenied("grant lost the race")
         con.execute(
             "INSERT INTO claims (fp, account, channel, body, attachment, approved, status) "
             "VALUES (?,?,?,?,?,1,'claimed')",
