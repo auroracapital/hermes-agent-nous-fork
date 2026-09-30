@@ -62,7 +62,9 @@ jobs:
   detect:
     name: Detect affected areas
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    # Checkout plus the compare API can exceed one minute on hosted runners;
+    # cancellation here skips every lane and fails the aggregate gate.
+    timeout-minutes: 5
     outputs:
       python: ${{ steps.gate-lanes.outputs.python }}
       python_prod: ${{ steps.gate-lanes.outputs.python_prod }}

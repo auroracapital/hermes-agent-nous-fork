@@ -36,6 +36,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 from agent.compression_marker import ELISION_MARKER_MAX_LEN, elide
 from agent.retry_utils import parse_retry_after_seconds
 from agent.secret_scope import get_secret
+from plugins.platforms.slack.egress_guard import EgressDenied, claim as egress_claim, mark as egress_mark
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, env_is_connected as _env_is_connected,
@@ -2202,18 +2203,23 @@ class SlackAdapter(BasePlatformAdapter):
         """``client_fn().<method>(**kwargs)``; on a Block Kit rejection retry once without
         ``blocks`` (an edit sends ``blocks=[]`` so the message drops its stale layout). The client
         is re-resolved for the retry."""
+        fp = egress_claim(
+            account=str(kwargs.get("channel") or ""),
+            channel=str(kwargs.get("channel") or ""),
+            text=str(kwargs.get("text") or ""),
+            attachment=str(kwargs.get("filename") or ""),
+            approved=bool(kwargs.pop("_egress_approved", False)),
+            tool_name=method,
+        )
         try:
-            return await getattr(client_fn(), method)(**kwargs)
+            result = await getattr(client_fn(), method)(**kwargs)
+            egress_mark(fp, "sent")
+            return result
         except Exception as e:
-            if kwargs.get("blocks") and self._is_block_payload_rejection(e):
-                retry_kwargs = dict(kwargs)
-                if verb == "edit":
-                    retry_kwargs["blocks"] = []
-                else:
-                    retry_kwargs.pop("blocks", None)
-                logger.info(
-                    "[Slack] Block Kit payload rejected; retrying %s without blocks: %s", verb, e)
-                return await getattr(client_fn(), method)(**retry_kwargs)
+            try:
+                egress_mark(fp, "uncertain")
+            except Exception:
+                pass
             raise
 
     async def send(
@@ -3231,12 +3237,24 @@ class SlackAdapter(BasePlatformAdapter):
         missing scope) are debug-logged only."""
         if not self._app:
             return False
+        fp = egress_claim(
+            account=channel, channel=channel, text=f"{emoji}:{timestamp}",
+            approved=bool(getattr(self, "_egress_approved", False)),
+            tool_name="reactions_remove" if remove else "reactions_add",
+        )
         try:
             client = self._get_client(channel, team_id=team_id or None)
             method = client.reactions_remove if remove else client.reactions_add
             await method(channel=channel, timestamp=timestamp, name=emoji)
+            egress_mark(fp, "sent")
             return True
+        except EgressDenied:
+            raise
         except Exception as e:
+            try:
+                egress_mark(fp, "uncertain")
+            except Exception:
+                pass
             logger.debug(
                 "[Slack] reactions.%s failed (%s): %s", "remove" if remove else "add", emoji, e)
             return False
@@ -6569,20 +6587,40 @@ async def _standalone_post_text(
     client, chat_id: str, text: Any, unfurl_kwargs: Dict[str, Any], thread_id: Optional[str]
 ) -> Dict[str, Any]:
     """``chat.postMessage`` via the SDK client; returns the response as a plain dict."""
+    fp = egress_claim(
+        account=str(chat_id), channel=str(chat_id), text=str(text or ""),
+        approved=bool(unfurl_kwargs.pop("_egress_approved", False)) if isinstance(unfurl_kwargs, dict) else False,
+        tool_name="chat.postMessage",
+    )
     kwargs = _standalone_post_kwargs(chat_id, text, unfurl_kwargs, thread_id)
-    return _slack_response_payload(await client.chat_postMessage(**kwargs))
+    try:
+        payload = _slack_response_payload(await client.chat_postMessage(**kwargs))
+        egress_mark(fp, "sent")
+        return payload
+    except Exception:
+        egress_mark(fp, "uncertain")
+        raise
 
 
 async def _standalone_upload_file(
     client, chat_id: str, media_path: str, *, initial_comment: str = "",
-    thread_id: Optional[str] = None) -> Dict[str, Any]:
+    thread_id: Optional[str] = None, approved: bool = False) -> Dict[str, Any]:
     """Upload one local file via ``files_upload_v2`` (same API as the live adapter)."""
+    fp = egress_claim(
+        account=str(chat_id), channel=str(chat_id),
+        text=initial_comment or "", attachment=os.path.basename(media_path),
+        approved=approved, tool_name="files_upload_v2",
+    )
     kwargs: Dict[str, Any] = {
         "channel": chat_id, "file": media_path, "filename": os.path.basename(media_path),
         "initial_comment": initial_comment or ""}
     if thread_id:
         kwargs["thread_ts"] = thread_id
-    result = await client.files_upload_v2(**kwargs)
+    try:
+        result = await client.files_upload_v2(**kwargs)
+    except Exception:
+        egress_mark(fp, "uncertain")
+        raise
     payload = _slack_response_payload(result)
     if payload.get("ok") is False:
         return send_error(f"Slack API error: {payload.get('error', 'unknown')}")
