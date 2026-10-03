@@ -1,5 +1,9 @@
 #!/bin/bash
 set -euo pipefail
+if [[ ${HERMES_HOME:-/home/ubuntu/.hermes} != /home/ubuntu/.hermes ]]; then
+  printf '%s\n' 'Foreign HERMES_HOME refused' >&2
+  exit 1
+fi
 export HERMES_HOME=/home/ubuntu/.hermes
 export PYTHONPATH=/home/ubuntu/hermes-agent-upstream
 out="$HERMES_HOME/state/alibaba-safe-candidates"

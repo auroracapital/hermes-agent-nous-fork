@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-spec = importlib.util.spec_from_file_location('safe', Path(__file__).parents[1] / 'hypest_alibaba_safe.py')
+spec = importlib.util.spec_from_file_location('safe', Path(__file__).parents[2] / 'scripts' / 'hypest_alibaba_safe.py')
 assert spec is not None and spec.loader is not None
 safe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(safe)
@@ -56,6 +56,27 @@ class MergeTests(unittest.TestCase):
     def test_iso_date(self):
         self.capture['pages'][0]['rows'][0]['order_date_raw'] = '2026-05-07'
         self.assertEqual(safe.merge(self.existing, self.capture)['orders'][0]['order_date'], '2026-05-07')
+
+
+    def test_account_exact_not_substring(self):
+        browser = safe.ExistingHermesBrowser.__new__(safe.ExistingHermesBrowser)
+        browser.identity = {}
+        browser.navigate = lambda url: None
+        browser.wait = lambda *args: {'url': safe.ACCOUNT_URL, 'text': 'Fixture buyer extra\nEmail\nmasked\nMember ID\nfixture-member-extra'}
+        with self.assertRaises(ValueError): browser.account()
+        browser.wait = lambda *args: {'url': safe.ACCOUNT_URL, 'text': 'Fixture buyer\nEmail\nmasked\nMember ID\nfixture-member'}
+        self.assertEqual(browser.account()['member_id'], 'fixture-member')
+
+    def test_lost_tab_navigation_never_creates(self):
+        from unittest.mock import Mock
+        browser = safe.ExistingHermesBrowser.__new__(safe.ExistingHermesBrowser)
+        browser.session = {'tab_id': 'pinned', 'user_id': 'agent-default'}
+        browser.tab_id = 'pinned'
+        browser.camo = Mock()
+        browser.camo._post.side_effect = RuntimeError('404 lost tab')
+        with self.assertRaises(RuntimeError): browser.navigate(safe.ACCOUNT_URL)
+        browser.camo._ensure_tab.assert_not_called()
+        browser.camo._post.assert_called_once()
 
 
 if __name__ == '__main__': unittest.main()

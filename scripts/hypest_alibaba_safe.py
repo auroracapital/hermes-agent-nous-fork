@@ -71,12 +71,16 @@ class ExistingHermesBrowser:
         import os
         os.environ.setdefault('CAMOFOX_URL', 'http://127.0.0.1:9377')
         os.environ.setdefault('CAMOFOX_USER_ID', 'agent-default')
+        os.environ['CAMOFOX_ADOPT_EXISTING_TAB'] = 'true'
         from tools import browser_camofox as camo, browser_tool as bt
         require(camo.is_camofox_mode(), 'Not the proven Camofox backend')
         session = camo._get_session(None)
         require(session.get('tab_id'), 'No existing tab; do not create/login')
         require(session['user_id'] == 'agent-default', 'Unexpected browser identity')
         self.bt = bt
+        self.camo = camo
+        self.session = session
+        self.tab_id = session['tab_id']
         self.identity = {'backend': 'camofox', 'url': camo.get_camofox_url(), 'tab_id': session['tab_id'], 'user_id': session['user_id']}
 
     def call(self, func, **kwargs):
@@ -85,9 +89,16 @@ class ExistingHermesBrowser:
         return result
 
     def navigate(self, url):
-        return self.call('browser_navigate', url=url)
+        require(url in (ACCOUNT_URL, LIST_URL), 'Unexpected navigation target')
+        require(self.session.get('tab_id') == self.tab_id, 'Pinned tab changed')
+        # Same backend transport, but deliberately never _ensure_tab/_navigate_tab:
+        # a 404 raises instead of creating a replacement or attempting login.
+        result = self.camo._post(f'/tabs/{self.tab_id}/navigate', {'userId': self.session['user_id'], 'url': url}, timeout=60)
+        require(not result.get('error'), 'Pinned navigation failed')
+        return result
 
     def evaluate(self, expression):
+        require(self.session.get('tab_id') == self.tab_id, 'Pinned tab changed')
         return self.call('browser_console', expression=expression)['result']
 
     def wait(self, expression, predicate):
@@ -101,8 +112,14 @@ class ExistingHermesBrowser:
     def account(self):
         require(bool(NAME) and bool(MEMBER_ID), 'Expected account identity not configured')
         self.navigate(ACCOUNT_URL)
-        text = self.wait('document.body.innerText', lambda s: NAME in s and MEMBER_ID in s)
-        return {'member_id': MEMBER_ID, 'name': NAME, 'url': ACCOUNT_URL, 'browser': self.identity}
+        observed = self.wait("JSON.stringify({url:location.href,text:document.body.innerText})", lambda p: 'Member ID' in p['text'])
+        require(observed['url'] == ACCOUNT_URL, 'Not account settings')
+        match = re.search(r'([^\n]+)\nEmail\n[^\n]+\nMember ID\n([^\n]+)', observed['text'])
+        require(match is not None, 'Account identity fields missing')
+        assert match is not None
+        name, member_id = match[1].strip(), match[2].strip()
+        require(name == NAME and member_id == MEMBER_ID, 'Wrong HYPEST account')
+        return {'member_id': member_id, 'name': name, 'url': observed['url'], 'browser': self.identity}
 
     def capture(self):
         account = self.account()
@@ -131,8 +148,10 @@ def main():
     existing = json.loads(args.existing.read_text(encoding='utf-8-sig'))
     capture = ExistingHermesBrowser().capture()
     candidate = merge(existing, capture)
-    args.evidence.write_text(json.dumps(capture, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    args.candidate.write_text(json.dumps(candidate, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    with args.evidence.open('x', encoding='utf-8') as stream:
+        stream.write(json.dumps(capture, ensure_ascii=False, indent=2) + '\n')
+    with args.candidate.open('x', encoding='utf-8') as stream:
+        stream.write(json.dumps(candidate, ensure_ascii=False, indent=2) + '\n')
     print(json.dumps({'verified_orders': len(candidate['orders']), 'pages': len(capture['pages']), 'candidate': str(args.candidate), 'evidence': str(args.evidence), 'live_written': False}))
 
 

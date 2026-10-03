@@ -14,7 +14,7 @@ Bewijs en kandidaat:
 
 ## Exacte backend
 
-De gewone browser_navigate en browser_console draaien Camofox REST op http://127.0.0.1:9377, userId agent-default, bestaande lokaal geverifieerde tab. GET /tabs zonder userId gaf [] terwijl /health activeTabs=1 gaf; GET /tabs?userId=agent-default toont de live tab. Dit is identiteitsfiltering, geen lege browser. Config cloud_provider/backend=camofox, CDP leeg, browser_backend_name()=camofox; userAgent Firefox/152.0. Skills' algemene profielnaam is niet het actuele accountbewijs: echte pagina toont Michelle.
+De gewone browser_navigate en browser_console draaien Camofox REST op http://127.0.0.1:9377, userId agent-default, bestaande lokaal geverifieerde tab. GET /tabs zonder userId gaf [] terwijl /health activeTabs=1 gaf; GET /tabs?userId=agent-default toont de live tab. Dit is identiteitsfiltering, geen lege browser. Config cloud_provider/backend=camofox, CDP leeg, browser_backend_name()=camofox; userAgent Firefox/152.0. Skills' algemene profielnaam is niet het actuele accountbewijs: echte pagina bevestigt het bedoelde account.
 
 ## Gedrag en tests
 
