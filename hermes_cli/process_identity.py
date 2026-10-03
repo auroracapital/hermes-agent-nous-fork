@@ -189,9 +189,12 @@ def _pid_alive_matches(pid: int, create_time: Optional[float], *, strict: bool =
         return None
     try:
         proc = psutil.Process(int(pid))
+        # A zombie retains PID/create_time but no longer runs old code. Treat it
+        # as dead for both strict verifiers and conservative ledger readers.
+        if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+            return False
         if strict:
-            return (create_time is not None and proc.create_time() == create_time
-                    and proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE)
+            return create_time is not None and proc.create_time() == create_time
         return _same_incarnation(proc, create_time)
     except psutil.NoSuchProcess:
         return False

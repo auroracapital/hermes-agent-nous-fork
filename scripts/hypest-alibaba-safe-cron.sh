@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 if [[ ${HERMES_HOME:-/home/ubuntu/.hermes} != /home/ubuntu/.hermes ]]; then
   printf '%s\n' 'Foreign HERMES_HOME refused' >&2

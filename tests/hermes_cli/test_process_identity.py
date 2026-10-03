@@ -40,9 +40,11 @@ def _fake_psutil(procs: dict[int, float]):
         proc = MagicMock()
         proc.pid = pid
         proc.create_time.return_value = procs[pid]
+        proc.is_running.return_value = True
+        proc.status.return_value = 'running'
         return proc
 
-    return types.SimpleNamespace(Process=_process, NoSuchProcess=_FakeNoSuchProcess)
+    return types.SimpleNamespace(Process=_process, NoSuchProcess=_FakeNoSuchProcess, STATUS_ZOMBIE='zombie')
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +228,16 @@ def test_ledger_entries_filters_dead_reused_and_foreign(tmp_path):
          patch.object(pi, "_ledger_path", return_value=ledger):
         live = pi.ledger_entries(project_root=Path("/x/install"))
     assert [e["pid"] for e in live] == [100]
+
+
+def test_zombie_incarnation_is_not_alive():
+    fake = _fake_psutil({500: 5.0})
+    proc = fake.Process(500)
+    proc.status.return_value = fake.STATUS_ZOMBIE
+    fake.Process = lambda pid: proc
+    with patch.dict(sys.modules, {'psutil': fake}):
+        assert pi._pid_alive_matches(500, 5.0) is False
+        assert pi._pid_alive_matches(500, 5.0, strict=True) is False
 
 
 def test_spawner_is_dead_tristate():
