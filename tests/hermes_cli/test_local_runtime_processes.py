@@ -151,6 +151,18 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
     jobs, children, handles = [], [], []
     real_init = processes._WindowsJob.__init__
     real_assign = processes._WindowsJob.assign
+    winapi = getattr(subprocess, '_winapi')
+    real_create = winapi.CreateProcess
+    primary_threads = {}
+
+    def track_create(*args, **kwargs):
+        result = real_create(*args, **kwargs)
+        # Popen closes the primary thread handle, but its ID lets us inspect
+        # that exact thread rather than psutil's aggregate process status.
+        primary_threads[result[2]] = result[3]
+        return result
+
+    monkeypatch.setattr(winapi, 'CreateProcess', track_create)
 
     def track_job(job):
         jobs.append(job)
@@ -174,7 +186,29 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
 
     def assign(job, proc):
         children.append(proc)
-        assert psutil.Process(proc.pid).status() == psutil.STATUS_STOPPED
+        # CREATE_SUSPENDED stops the primary thread, not necessarily every
+        # Windows loader thread; psutil.status() can therefore say 'running'.
+        # SuspendThread returns the *previous* kernel suspend count. Restore
+        # our increment without ever reducing the original count to zero.
+        api = job._api
+        api.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        api.OpenThread.restype = wintypes.HANDLE
+        for name in ('SuspendThread', 'ResumeThread'):
+            fn = getattr(api, name)
+            fn.argtypes = [wintypes.HANDLE]
+            fn.restype = wintypes.DWORD
+        thread = api.OpenThread(0x0002, False, primary_threads[proc.pid])
+        assert thread, 'could not open the primary thread for suspension proof'
+        try:
+            previous = api.SuspendThread(thread)
+            assert previous != 0xFFFFFFFF, 'SuspendThread failed'
+            # Fail closed: if the original suspension is missing, keep our
+            # increment until spawn_server's exception cleanup kills it.
+            assert previous == 1, 'primary thread was not CREATE_SUSPENDED'
+            restored = api.ResumeThread(thread)
+            assert restored == 2, 'could not restore suspend count'
+        finally:
+            assert api.CloseHandle(thread), 'primary thread inspection handle leaked'
         assert not marker.exists()
         # Query the actual kernel object, not implementation source/constants.
         limits = processes._ExtendedLimits()

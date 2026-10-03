@@ -128,11 +128,11 @@ def main():
     require(args.candidate.resolve() != LIVE.resolve() and args.candidate.resolve() != args.existing.resolve(), 'Never write live/source orders')
     require(args.evidence.resolve() not in (LIVE.resolve(), args.existing.resolve(), args.candidate.resolve()), 'Evidence target collision')
     require(not args.candidate.exists() and not args.evidence.exists(), 'Output must be new')
-    existing = json.loads(args.existing.read_text())
+    existing = json.loads(args.existing.read_text(encoding='utf-8-sig'))
     capture = ExistingHermesBrowser().capture()
     candidate = merge(existing, capture)
-    args.evidence.write_text(json.dumps(capture, ensure_ascii=False, indent=2) + '\n')
-    args.candidate.write_text(json.dumps(candidate, ensure_ascii=False, indent=2) + '\n')
+    args.evidence.write_text(json.dumps(capture, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    args.candidate.write_text(json.dumps(candidate, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(json.dumps({'verified_orders': len(candidate['orders']), 'pages': len(capture['pages']), 'candidate': str(args.candidate), 'evidence': str(args.evidence), 'live_written': False}))
 
 
