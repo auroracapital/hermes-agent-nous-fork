@@ -30,7 +30,7 @@ from agent.error_classifier import (
     FailoverReason, PROVIDER_STREAM_EMPTY_FRAME_ERROR_CODE, PROVIDER_STREAM_NON_JSON_ERROR_CODE,
     _extract_status_code)
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
-from agent.errors import EmptyStreamError
+from agent.errors import EmptyStreamError, StaleStreamNoOutputError
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
@@ -2875,6 +2875,8 @@ class _StreamingCall(StreamingWaitMonitor):
         self._stream_stale_timeout = None
         self.stream_attempt_lock = threading.Lock()
         self.stream_attempt_state = {"current": 0, "cancelled": set(), "discarded_chunks": 0, "discarded_bytes": 0}
+        # Distinguish a stale kill from an ordinary disconnect for this attempt only.
+        self.stale_killed_attempt = {"id": 0}
         self._stale_counted_attempts: set[int] = set()  # breaker counts each attempt once
         self.managed_stream_holder = {"stream": None}
         # Per-attempt: single-writer token, request-local client, raw HTTP response (chat wire).
@@ -3680,6 +3682,19 @@ class _StreamingCall(StreamingWaitMonitor):
             diagnostic=True,
         )
 
+    def _stale_fast_fallback_applies(self) -> bool:
+        """True when the attempt that just failed was killed by the stale detector before
+        any output, and a fallback provider is pending. Retrying the same silent model
+        costs a full stale timeout per attempt (900s each on a loopback endpoint).
+        HERMES_STALE_FAST_FALLBACK=0 restores same-model retries."""
+        if env_int("HERMES_STALE_FAST_FALLBACK", 1) <= 0 or self.deltas_were_sent["yes"]:
+            return False
+        with self.stream_attempt_lock:
+            killed_id = self.stale_killed_attempt["id"]
+            killed = bool(killed_id) and killed_id == int(self.stream_attempt_state["current"])
+        has_pending = getattr(self.agent, "_has_pending_fallback", None)
+        return killed and callable(has_pending) and bool(has_pending())
+
     def _handle_stream_error(self, e: Exception, attempt: int, max_retries: int) -> bool:
         """Classify a failed attempt: True = retry; False = stop with
         ``result["error"]`` set (unless our own interrupt force-closed the
@@ -3701,6 +3716,17 @@ class _StreamingCall(StreamingWaitMonitor):
         _is_empty_stream = isinstance(e, EmptyStreamError)
         _is_sse_conn_err = not _is_timeout and not _is_conn_err and _is_sse_connection_error(e)
         _is_transient = _is_timeout or _is_conn_err or _is_sse_conn_err or _is_stream_parse_err
+
+        if _is_transient and self._stale_fast_fallback_applies():
+            _timeout = float(self._stream_stale_timeout or 0)
+            logger.warning(
+                "Stale stream produced no output (model=%s, stale timeout %.0fs, attempt %d/%d) — "
+                "skipping same-model retries; handing off to fallback.",
+                self.api_kwargs.get("model", "unknown"), _timeout, attempt + 1, max_retries + 1)
+            err = StaleStreamNoOutputError(f"No output from provider within the {_timeout:.0f}s stale timeout")
+            err.__cause__ = e
+            self.result["error"] = err
+            return False
 
         if not self.deltas_were_sent["yes"] and not getattr(self.agent, "_stream_options_unsupported", False) and _rejects_stream_options(e):
             # Nothing streamed yet: drop the usage extension for this session and re-open.
@@ -3949,6 +3975,8 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._buffer_diagnostic_status(
             f"⚠️ No response from provider for {int(elapsed)}s (model: {self.api_kwargs.get('model', 'unknown')}, "
             f"context: ~{_est_ctx:,} tokens). Reconnecting...")
+        with self.stream_attempt_lock:
+            self.stale_killed_attempt["id"] = int(self.stream_attempt_state["current"])
         # Captured BEFORE the cancel/abort: the pool sweep can miss a checked-out
         # connection, so shut down the killed attempt's own socket too — still
         # shutdown-only, never close (see the helper).

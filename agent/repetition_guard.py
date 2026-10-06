@@ -45,6 +45,17 @@ _RUNAWAY_DISTINCT_LINE_RATIO = 0.5
 # identical table rows, templated YAML) stay in the low KB and must be delivered.
 STOP_PATH_MIN_CHARS = 16_000
 
+# Visible-text accumulation cuts loops at 8k, then at doubled thresholds.
+STREAM_GUARD_FIRST_CHECK_CHARS = 8_000
+STREAM_GUARD_GROWTH_FACTOR = 2
+STREAM_LOOP_INTERRUPT_REASON = "repetition_loop"
+
+
+def next_stream_guard_threshold(current: int) -> int:
+    """The accumulated length at which the visible-text guard checks again."""
+    return max(STREAM_GUARD_FIRST_CHECK_CHARS, current * STREAM_GUARD_GROWTH_FACTOR)
+
+
 # A live stream is judged on at most this much of its latest text, so one check stays bounded
 # however long the reply grows.
 _STREAM_TAIL_CHARS = 4 * STOP_PATH_MIN_CHARS
