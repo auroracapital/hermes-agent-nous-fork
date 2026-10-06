@@ -95,11 +95,45 @@ def test_classified_as_timeout_not_context_overflow(approx_tokens, num_messages)
     assert not classified.should_compress
 
 
-def test_turn_recovery_fails_over_on_stale_error_without_retry_budget():
-    import inspect
+@pytest.mark.parametrize("stale_killed", [True, False])
+def test_turn_recovery_fails_over_on_stale_error_without_retry_budget(stale_killed):
+    from agent.turn_recovery import route_classified_error
+    from agent.turn_retry_state import TurnRetryState
 
-    import agent.turn_recovery as tr
+    agent = MagicMock()
+    agent.provider = "custom"
+    agent.model = "kimi-latest"
+    agent._fallback_index = 0
+    agent._fallback_chain = [{"provider": "custom", "model": "fallback-model"}]
+    agent._credential_pool = None
+    agent._cached_system_prompt = None
+    agent._try_activate_fallback.return_value = True
+    retry = TurnRetryState()
+    error = StaleStreamNoOutputError("No output within the 300s stale timeout") if stale_killed else _drop()
+    if stale_killed:
+        error.__cause__ = _drop()
+    classified = classify_api_error(
+        error, provider=agent.provider, model=agent.model, approx_tokens=1_000,
+        context_length=200_000, num_messages=1)
+    messages = [{"role": "user", "content": "hello"}]
 
-    src = inspect.getsource(tr)
-    assert "isinstance(api_error, StaleStreamNoOutputError)" in src
-    assert tr.StaleStreamNoOutputError is StaleStreamNoOutputError
+    verdict = route_classified_error(
+        agent, error, classified, retry, error_msg=str(error), error_context={},
+        recovered_with_pool=False, base_url="http://127.0.0.1:8318/v1", model=agent.model,
+        messages=messages, api_messages=list(messages), system_message=None,
+        active_system_prompt="stable prompt", conversation_history=[], retry_count=0,
+        max_retries=3, compression_attempts=0, max_compression_attempts=2,
+        api_call_count=1, effective_task_id=None)
+
+    assert verdict.retry_count == 0
+    assert verdict.active_system_prompt == "stable prompt"
+    if stale_killed:
+        agent._try_activate_fallback.assert_called_once_with(
+            reason=FailoverReason.timeout, reset_at=None)
+        assert verdict.action == "break"
+        assert retry.restart_with_rebuilt_messages is True
+        assert verdict.compression_attempts == 0
+    else:
+        agent._try_activate_fallback.assert_not_called()
+        assert verdict.action == "fallthrough"
+        assert retry.restart_with_rebuilt_messages is False
