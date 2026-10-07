@@ -87,6 +87,8 @@ def _reaction_update(reactions, chat_id: object = 123, message_id: object = 456)
     update.message_reaction.chat.id = chat_id
     update.message_reaction.message_id = message_id
     update.message_reaction.new_reaction = list(reactions)
+    update.edited_message = None
+    update.callback_query = None
     return update
 
 
@@ -249,6 +251,7 @@ class TestNormalizePlatformEvent:
         update = MagicMock()
         update.message_reaction = None  # e.g. a chat_member update
         update.edited_message = None
+        update.callback_query = None
 
         assert a._normalize_platform_event(update) is None
 
@@ -282,6 +285,7 @@ def _edited_update(
     m.from_user.username = "editor"
     m.from_user.full_name = "Editor"
     update.edited_message = m
+    update.callback_query = None
     return update
 
 
@@ -346,6 +350,133 @@ class TestNormalizeMessageEdited:
         event = a._normalize_platform_event(update)
         assert len(event["payload"]["text"]) == 8192
         json.dumps(event)
+
+
+# ---------------------------------------------------------------------------
+# TelegramAdapter callback_query normalization — inline button taps
+# ---------------------------------------------------------------------------
+
+def _callback_update(
+    *,
+    data: object = "ok:abcdef0123:0123456789abcdef",
+    user_id: object = 777,
+    chat_id: object = 123,
+    message_id: object = 456,
+    callback_id: object = "cb1",
+    date: object = 1727000000,
+):
+    """A PTB Update stand-in carrying a callback_query (an inline button tap)."""
+    import datetime as _dt
+
+    update = MagicMock()
+    update.message_reaction = None
+    update.edited_message = None
+    q = MagicMock()
+    q.id = callback_id
+    q.data = data
+    q.from_user.id = user_id
+    q.from_user.username = "tapper"
+    q.from_user.full_name = "Tapper"
+    q.from_user.is_bot = False
+    q.message.chat.id = chat_id
+    q.message.chat.type = "private"
+    q.message.chat.is_forum = False
+    q.message.message_id = message_id
+    q.message.message_thread_id = None
+    q.message.is_topic_message = False
+    q.message.date = _dt.datetime(2026, 9, 22, 12, 0, tzinfo=_dt.timezone.utc)
+    update.callback_query = q
+    # The tap time lives on the query itself, never on the card it belongs to.
+    if isinstance(date, (int, float)) and not isinstance(date, bool):
+        q.date = _dt.datetime.fromtimestamp(date, tz=_dt.timezone.utc)
+    else:
+        q.date = date
+    return update
+
+
+class TestNormalizeCallbackQuery:
+    def test_button_tap_normalized_with_tap_time(self):
+        """A callback_query becomes the envelope samimizer's approval plugin
+        consumes: the TAP time, not the card message's own date."""
+        a = _adapter()
+        update = _callback_update(data="deck:n", user_id=777, chat_id=123,
+                                   message_id=456, callback_id="cb1", date=1727000000)
+
+        assert a._normalize_platform_event(update) == {
+            "platform": "telegram",
+            "event_type": "callback_query",
+            "payload": {
+                "platform": "telegram",
+                "user_id": "777",
+                "chat_id": "123",
+                "message_id": "456",
+                "data": "deck:n",
+                "date": 1727000000,
+                "callback_query_id": "cb1",
+            },
+        }
+
+    def test_tap_time_is_never_the_card_message_date(self):
+        a = _adapter()
+        update = _callback_update(date=1727000000)
+
+        event = a._normalize_platform_event(update)
+        assert event["payload"]["date"] == 1727000000
+        assert event["payload"]["date"] != int(update.callback_query.message.date.timestamp())
+
+    def test_missing_tap_time_is_none_not_invented(self):
+        a = _adapter()
+        update = _callback_update(date=None)
+
+        event = a._normalize_platform_event(update)
+        assert event["payload"]["date"] is None
+
+    def test_malformed_callback_returns_none(self):
+        a = _adapter()
+        assert a._normalize_platform_event(_callback_update(data=object())) is None
+        assert a._normalize_platform_event(_callback_update(user_id=object())) is None
+        assert a._normalize_platform_event(_callback_update(chat_id=None)) is None
+        assert a._normalize_platform_event(_callback_update(message_id=None)) is None
+        assert a._normalize_platform_event(_callback_update(callback_id="")) is None
+
+    def test_callback_strings_are_bounded_and_json_safe(self):
+        a = _adapter()
+        update = _callback_update(data="x" * 5000, callback_id="c" * 500)
+
+        event = a._normalize_platform_event(update)
+        assert len(event["payload"]["data"]) == 256
+        assert len(event["payload"]["callback_query_id"]) == 128
+        json.dumps(event)
+
+    def test_callback_tap_fires_through_boundary_with_tapping_user(self):
+        a = _adapter()
+        seen: list = []
+
+        async def observe(event, source):
+            seen.append((event, source))
+
+        a.set_platform_event_handler(observe)
+        asyncio.run(a._on_platform_update(_callback_update(user_id=777), context=MagicMock()))
+
+        assert len(seen) == 1
+        event, source = seen[0]
+        assert event["event_type"] == "callback_query"
+        assert source.user_id == "777"
+        assert source.chat_id == "123"
+
+    def test_callback_without_tapping_user_fails_closed(self):
+        a = _adapter()
+        seen: list = []
+
+        async def observe(event, source):
+            seen.append((event, source))
+
+        a.set_platform_event_handler(observe)
+        update = _callback_update()
+        update.callback_query.from_user = None
+
+        asyncio.run(a._on_platform_update(update, context=MagicMock()))
+        assert seen == []
 
     def test_edited_event_fires_through_boundary_with_editor_source(self):
         a = _adapter()
@@ -415,6 +546,8 @@ class TestOnPlatformUpdate:
 
         update = MagicMock()
         update.message_reaction = None
+        update.edited_message = None
+        update.callback_query = None
         asyncio.run(a._on_platform_update(update, context=MagicMock()))
 
         assert seen == []
@@ -466,6 +599,7 @@ class TestOnPlatformUpdateAuthBoundary:
         update = MagicMock()
         update.message_reaction = None  # a future, not-yet-wired event type
         update.edited_message = None
+        update.callback_query = None
         # Simulate that future normalization produced an event for it.
         a._normalize_platform_event = lambda u: {  # type: ignore[assignment]
             "platform": "telegram", "event_type": "future", "payload": {},

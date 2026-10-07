@@ -914,6 +914,74 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         return self.build_source(
             chat_id=chat_id, chat_type=chat_type, user_id=user_id, user_name=user_name, thread_id=None, message_id=str(message_id))
 
+    def _source_from_callback_for_auth(self, update):
+        """SessionSource for the user who tapped an inline button.
+
+        The tapping user is ``callback_query.from_user``; the chat and message
+        are the card the button sits on. Raises ``ValueError`` when either
+        identity is absent so the post-auth boundary fails closed.
+        """
+        query = getattr(update, "callback_query", None)
+        message = getattr(query, "message", None) if query is not None else None
+        if query is None or message is None:
+            raise ValueError("gateway_platform_event callback_query requires a query with a message")
+        source = self._source_from_message_for_auth(message)
+        user = getattr(query, "from_user", None)
+        user_id = str(getattr(user, "id", "")).strip() or None
+        if not user_id or not source.user_id or not source.chat_id:
+            raise ValueError("gateway_platform_event callback_query requires tapping user and chat identities")
+        # The tapper, not the card's sender (which is the bot itself).
+        source.user_id = user_id
+        source.user_name = str(
+            getattr(user, "username", "") or getattr(user, "full_name", "") or "").strip() or None
+        source.is_bot = bool(getattr(user, "is_bot", False))
+        return source
+
+    def _normalize_callback_query_event(self, update) -> Optional[Dict[str, Any]]:
+        """``callback_query`` → ``callback_query`` event: the inline-button tap.
+
+        ``date`` is the TAP time (``callback_query``'s own date), never the card
+        message's date, and ``None`` when Telegram sent none — never invented.
+        Payload matches the samimizer approval plugin's contract:
+        platform, user_id, chat_id, message_id (the card), data, date,
+        callback_query_id.
+        """
+        query = getattr(update, "callback_query", None)
+        if query is None:
+            return None
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None) if message is not None else None
+        user = getattr(query, "from_user", None)
+        user_id = getattr(user, "id", None)
+        chat_id = getattr(chat, "id", None)
+        message_id = getattr(message, "message_id", None) if message is not None else None
+        callback_id = getattr(query, "id", None)
+        data = getattr(query, "data", None)
+        if (not self._is_id_like(user_id) or not self._is_id_like(chat_id)
+                or not self._is_id_like(message_id) or not self._is_id_like(callback_id)
+                or not isinstance(data, str) or not str(callback_id).strip()):
+            return None
+        date = None
+        tap_date = getattr(query, "date", None)
+        try:
+            if tap_date is not None and hasattr(tap_date, "timestamp"):
+                date = int(tap_date.timestamp())
+        except Exception:
+            date = None
+        return {
+            "platform": "telegram",
+            "event_type": "callback_query",
+            "payload": {
+                "platform": "telegram",
+                "user_id": str(user_id)[:128],
+                "chat_id": str(chat_id)[:128],
+                "message_id": str(message_id)[:128],
+                "data": data[:256],
+                "date": date,
+                "callback_query_id": str(callback_id)[:128],
+            },
+        }
+
     def _telegram_auth_env_configured(self) -> bool:
         """Return True when Telegram auth env vars make an early decision safe."""
         keys = (
@@ -2498,6 +2566,19 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 kwargs["icon_color"] = icon_color
             if icon_custom_emoji_id:
                 kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
+            # HARD CAP (Sam, 2026-09-19, session 353132 flood: 186 topics in ~50 min).
+            # A run-away caller on a dead lane must never flood the chat again.
+            import time as _t
+            _now = _t.time()
+            _recent = [x for x in getattr(self, '_topic_create_times', []) if _now - x < 3600]
+            if len(_recent) >= 8:
+                logger.error(
+                    '[%s] Topic-creation cap hit (%d in the last hour) - refusing to create %s in chat %s',
+                    self.name, len(_recent), name, chat_id)
+                self._topic_create_times = _recent
+                return None
+            _recent.append(_now)
+            self._topic_create_times = _recent
             topic = await self._bot.create_forum_topic(**kwargs)
             thread_id = topic.message_thread_id
             logger.info("[%s] Created DM topic '%s' in chat %s -> thread_id=%s", self.name, name, chat_id, thread_id)
@@ -2779,6 +2860,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         raises ``ValueError`` for updates without one so the boundary fails closed."""
         if getattr(update, "message_reaction", None) is not None:
             return self._source_from_reaction_for_auth(update)
+        if getattr(update, "callback_query", None) is not None:
+            return self._source_from_callback_for_auth(update)
         edited = getattr(update, "edited_message", None)
         if edited is not None:
             source = self._source_from_message_for_auth(edited)
@@ -2795,6 +2878,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             return self._normalize_reaction_event(update)
         if getattr(update, "edited_message", None) is not None:
             return self._normalize_message_edited_event(update)
+        if getattr(update, "callback_query", None) is not None:
+            return self._normalize_callback_query_event(update)
         return None
 
     @staticmethod
@@ -4270,6 +4355,30 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Render a clarify prompt: numbered buttons per choice plus "✏️ Other (type answer)" (flips to
         text-capture mode); without choices, plain question and the gateway text-intercept captures."""
+        # Outbound approval cards must be preceded by a separate Telegram
+        # bubble containing the exact draft. Sam cannot reliably review a
+        # long email from the compact button card alone.
+        try:
+            from pathlib import Path
+            _hooks = Path(__file__).resolve().parents[4] / "agent-hooks"
+            if str(_hooks) not in sys.path:
+                sys.path.insert(0, str(_hooks))
+            from approval_card_canonicalizer import canonicalize_question_text
+            c_q, was_c = canonicalize_question_text(question)
+            if was_c:
+                question = c_q
+        except Exception:
+            pass
+        preview = re.search(r"VOLLEDIGE TEKST:\n(.*?)\nEINDE TEKST", question, re.DOTALL)
+        if preview:
+            draft = preview.group(1)
+            try:
+                await self._send_control_message(
+                    chat_id, draft, parse_mode=None, thread_id=self._metadata_thread_id(metadata),
+                    metadata=metadata)
+            except Exception as exc:
+                logger.warning("[%s] outbound preview failed: %s", self.name, _redact_telegram_error_text(exc))
+                return SendResult(success=False, error=_redact_telegram_error_text(exc))
         def build():
             text = f"❓ {_html.escape(question)}"
             keyboard = None
