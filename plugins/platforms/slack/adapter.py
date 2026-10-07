@@ -4453,6 +4453,92 @@ class SlackAdapter(BasePlatformAdapter):
                     "so a retry or edit can re-drive the turn", self.name, _ts)
             raise
 
+    def _slack_bot_hop_limit(self) -> int:
+        """Budget for bot summons since the last human turn; zero disables them."""
+        try:
+            return max(0, int(self.config.extra.get("bot_hop_limit", 1)))
+        except (TypeError, ValueError):
+            return 1
+
+    def _slack_count_bot_hops(self, messages: list) -> int:
+        """Count actual mentions, not claims, including unlabeled fleet bot users."""
+        import re
+
+        bot_users = getattr(self, "_fleet_bot_user_ids", (
+            "U0C01906BKL", "U0BVASPN63F", "U0C0VLG6FNC",
+            "U0C0VLG0XG8", "U0C4HQG6D5G",
+        ))
+        hops = 0
+        for msg in messages:
+            is_bot = bool(
+                msg.get("bot_id") or msg.get("bot_profile")
+                or msg.get("subtype") == "bot_message"
+                or msg.get("user") in bot_users
+                or msg.get("_slack_hop_is_bot")
+            )
+            if not is_bot:
+                # Unknown identity must not silently reopen an exhausted budget.
+                if msg.get("_slack_hop_identity_unknown"):
+                    continue
+                hops = 0
+            elif re.search(r"<@[A-Za-z0-9]+>", msg.get("text") or ""):
+                hops += 1
+        return hops
+
+    async def _slack_bot_hop_exhausted(
+        self, channel_id: str, thread_ts: str, team_id: str = "",
+        incoming_ts: str = "",
+    ) -> bool:
+        """Judge only prior turns, across reply pages, without blocking a first summons.
+
+        Preserve the existing transient Slack-error policy: lookup failures allow
+        the turn. This is a loop budget, not a new channel authorization policy.
+        """
+        limit = self._slack_bot_hop_limit()
+        if limit <= 0:
+            return True
+        try:
+            client = self._get_client(channel_id, team_id)
+            messages = []
+            cursor = ""
+            seen_cursors = set()
+            for _ in range(25):
+                kwargs = {"channel": channel_id, "ts": thread_ts, "limit": 200}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = await client.conversations_replies(**kwargs)
+                messages.extend(resp.get("messages") or [])
+                if not resp.get("has_more"):
+                    break
+                cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+                if not cursor or cursor in seen_cursors:
+                    return True  # An incomplete thread cannot prove remaining budget.
+                seen_cursors.add(cursor)
+            else:
+                return True
+            messages = [dict(msg) for msg in messages if not incoming_ts or msg.get("ts") != incoming_ts]
+            # users.info distinguishes unlabeled bot accounts from real humans;
+            # cached False from a failed lookup is not evidence of a human.
+            user_info = getattr(self, "_users_info_payload", None)
+            identities = {}
+            for msg in messages:
+                user = msg.get("user")
+                if not user_info or not user or msg.get("bot_id") or msg.get("bot_profile") or msg.get("subtype") == "bot_message":
+                    continue
+                if user not in identities:
+                    try:
+                        payload = await user_info(user, channel_id, team_id)
+                        account = payload.get("user") or {}
+                        identities[user] = self._parse_users_info(payload, user)[1] if account.get("id") == user else None
+                    except Exception:
+                        identities[user] = None
+                msg["_slack_hop_is_bot"] = identities[user] is True
+                msg["_slack_hop_identity_unknown"] = identities[user] is None
+            return self._slack_count_bot_hops(messages) >= limit
+        except Exception as exc:
+            logger.debug("[Slack] hop-limit lookup failed, allowing: %s", exc)
+            return False
+
     async def _drop_bot_sender(self, event: dict) -> bool:
         """allow_bots gate: ``none`` drops all bot posts (default), ``mentions`` those not
         @mentioning us, ``all`` accepts — own posts always drop (echo loops). Unlabeled events
@@ -4477,7 +4563,16 @@ class SlackAdapter(BasePlatformAdapter):
                     "[Slack] Dropping bot message under allow_bots=mentions: "
                     "no <@%s> mention in flat text or blocks", self._bot_user_id)
                 return True
-        return bool(msg_user and self._bot_user_id and msg_user == self._bot_user_id)
+        if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
+            return True
+        if await self._slack_bot_hop_exhausted(
+            channel_id=event.get("channel", ""),
+            thread_ts=event.get("thread_ts") or event.get("ts", ""),
+            team_id=str(event.get("team") or event.get("team_id") or ""),
+            incoming_ts=event.get("ts", ""),
+        ):
+            return True
+        return False
 
     async def _prefilter_inbound(
         self, event: dict, payload: Optional[dict]) -> Optional[Tuple[dict, str, str]]:
@@ -4555,7 +4650,15 @@ class SlackAdapter(BasePlatformAdapter):
         if not sender_is_bot_user:
             return False
         allow_bots = self._slack_allow_bots()
-        return allow_bots == "none" or (allow_bots == "mentions" and not is_mentioned)
+        if allow_bots == "none" or (allow_bots == "mentions" and not is_mentioned):
+            return True
+        if await self._slack_bot_hop_exhausted(
+            channel_id=channel_id,
+            thread_ts=event.get("thread_ts") or event.get("ts", ""),
+            team_id=team_id, incoming_ts=event.get("ts", ""),
+        ):
+            return True
+        return False
 
     def _apply_bot_mention(
         self, text: str, original_text: str, command_probe_text: str, is_command_text: bool,
