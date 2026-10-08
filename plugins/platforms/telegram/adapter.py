@@ -940,11 +940,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     def _normalize_callback_query_event(self, update) -> Optional[Dict[str, Any]]:
         """``callback_query`` → ``callback_query`` event: the inline-button tap.
 
-        ``date`` is the TAP time (``callback_query``'s own date), never the card
-        message's date, and ``None`` when Telegram sent none — never invented.
+        ``date`` is the TAP time, never the card message's date. Telegram's
+        CallbackQuery has no date field, so it is the moment this gateway
+        received the tap (``date_source="received"``); a Telegram-supplied date
+        wins if one ever exists (``date_source="telegram"``).
         Payload matches the samimizer approval plugin's contract:
         platform, user_id, chat_id, message_id (the card), data, date,
-        callback_query_id.
+        date_source, callback_query_id.
         """
         query = getattr(update, "callback_query", None)
         if query is None:
