@@ -962,12 +962,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 or not isinstance(data, str) or not str(callback_id).strip()):
             return None
         date = None
+        date_source = None
         tap_date = getattr(query, "date", None)
         try:
             if tap_date is not None and hasattr(tap_date, "timestamp"):
                 date = int(tap_date.timestamp())
+                date_source = "telegram"
         except Exception:
             date = None
+        if date is None and not hasattr(query, "date"):
+            # Telegram's CallbackQuery carries no time of its own (PTB has no
+            # ``date`` field), so the only honest tap time is when this gateway
+            # received it. Normalization runs on receipt. Never the card's date.
+            date = int(time.time())
+            date_source = "received"
         return {
             "platform": "telegram",
             "event_type": "callback_query",
@@ -978,6 +986,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 "message_id": str(message_id)[:128],
                 "data": data[:256],
                 "date": date,
+                "date_source": date_source,
                 "callback_query_id": str(callback_id)[:128],
             },
         }

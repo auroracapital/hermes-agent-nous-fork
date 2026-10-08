@@ -412,6 +412,7 @@ class TestNormalizeCallbackQuery:
                 "message_id": "456",
                 "data": "deck:n",
                 "date": 1727000000,
+                "date_source": "telegram",
                 "callback_query_id": "cb1",
             },
         }
