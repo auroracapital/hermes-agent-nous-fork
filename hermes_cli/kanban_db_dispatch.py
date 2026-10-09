@@ -1537,7 +1537,8 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
+    (PR URL in a recent worker comment or run output — not the spec or
+    creator's comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
     PR). The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
@@ -1619,33 +1620,109 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
+    # 4. GitHub PR URL from a recent WORKER — prior worker already opened a PR.
+    #    Only worker evidence counts: a comment by a profile that worked or owns
+    #    the card (never the creator's own comment unless it ran the card first),
+    #    or a run's own summary/metadata. A PR link in the spec or creator note is
+    #    the card's INPUT (e.g. "review PR 74"), not proof that a worker already
+    #    opened one; counting it parked review/fix cards for the whole 24 h window.
+    #    Exception: a handoff AFTER the newest PR evidence (operator reassign,
     #    reviewer changes_requested, review reopen) names the profile that must
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        body = _kb._lossy_text(c["body"])
-        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
-            continue
+    evidence_at = _latest_worker_pr_evidence(conn, task_id, pr_cutoff)
+    if evidence_at is not None:
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
             "SELECT kind, payload FROM task_events "
             "WHERE task_id = ? AND created_at > ? "
             "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-            (task_id, int(c["created_at"] or 0)),
+            (task_id, int(evidence_at)),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
         return "active_pr"
 
     return None
+
+
+def _latest_worker_pr_evidence(
+    conn: sqlite3.Connection, task_id: str, cutoff: int,
+) -> Optional[int]:
+    """Timestamp of the newest worker-produced GitHub PR link since ``cutoff``.
+
+    Counts (a) comments whose author is a worker of this card and (b) PR links
+    in a run's ``summary`` / ``metadata``. A comment author is a worker when a
+    run of this card by that profile had started at or before the comment, or
+    when the author has owned the card (initial, current or any reassigned
+    assignee) and is NOT its creator. The
+    creator's spec/notes and comments by bystanders (operators, the
+    orchestrator writing a brief) are inputs, not evidence. Returns None when
+    there is no worker PR evidence in the window.
+    """
+    task = conn.execute(
+        "SELECT assignee, created_by FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if task is None:
+        return None
+    creator = (task["created_by"] or "").strip()
+    # Every profile that has owned the card: current, initial and reassigned.
+    owners = {(task["assignee"] or "").strip()}
+    for e in conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('created', 'assigned')",
+        (task_id,),
+    ).fetchall():
+        data = _kb._json_or(e["payload"], {})
+        if isinstance(data, dict) and data.get("assignee"):
+            owners.add(str(data["assignee"]).strip())
+    owners.discard("")
+    run_starts: dict[str, int] = {}
+    for r in conn.execute(
+        "SELECT profile, MIN(started_at) AS first_start FROM task_runs "
+        "WHERE task_id = ? AND profile IS NOT NULL AND profile != '' "
+        "AND started_at IS NOT NULL GROUP BY profile",
+        (task_id,),
+    ).fetchall():
+        run_starts[str(r["profile"])] = int(r["first_start"])
+
+    def _is_worker_comment(author: str, created_at: int) -> bool:
+        author = (author or "").strip()
+        if not author:
+            return False
+        first_start = run_starts.get(author)
+        if first_start is not None and first_start <= created_at:
+            return True
+        return author in owners and author != creator
+
+    newest: Optional[int] = None
+    for c in conn.execute(
+        "SELECT author, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
+        (task_id, cutoff),
+    ).fetchall():
+        created_at = int(c["created_at"] or 0)
+        body = _kb._lossy_text(c["body"])
+        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+            continue
+        if _is_worker_comment(c["author"], created_at):
+            newest = created_at
+            break
+    for r in conn.execute(
+        "SELECT summary, metadata, COALESCE(ended_at, started_at) AS at "
+        "FROM task_runs WHERE task_id = ? AND COALESCE(ended_at, started_at) >= ?",
+        (task_id, cutoff),
+    ).fetchall():
+        text = " ".join(
+            _kb._lossy_text(v) or "" for v in (r["summary"], r["metadata"])
+        )
+        if text and _RESPAWN_GUARD_PR_URL_RE.search(text):
+            at = int(r["at"] or 0)
+            if newest is None or at > newest:
+                newest = at
+    return newest
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:

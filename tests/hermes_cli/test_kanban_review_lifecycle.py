@@ -929,3 +929,113 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
             "SELECT profile, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()
         assert (run["outcome"], run["profile"]) == ("blocked", None)
+
+
+# ---------------------------------------------------------------------------
+# active_pr counts only WORKER PR evidence, never the spec / creator comment.
+# A review card whose brief links the PR to review ("review PR 74") sat in
+# ready for the whole 24 h window because the brief itself tripped the guard.
+# ---------------------------------------------------------------------------
+
+_SPEC_PR = "Read-only review. PR: https://github.com/example/repo/pull/74"
+
+
+def _guard_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+
+
+def _insert_run(conn, tid, profile, *, started_offset=-30, summary=None,
+                metadata=None, ended=True):
+    now = int(__import__("time").time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, "
+            "ended_at, summary, metadata) VALUES (?, ?, 'done', ?, ?, ?, ?, ?)",
+            (tid, profile, "crashed" if ended else None, now + started_offset,
+             now + started_offset + 1 if ended else None, summary, metadata),
+        )
+
+
+def test_active_pr_ignores_pr_link_in_creator_spec_comment(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _guard_env(monkeypatch)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review PR 74", assignee="builder",
+                             created_by="default")
+        kb.add_comment(conn, tid, author="default", body=_SPEC_PR)
+        assert kbd.check_respawn_guard(conn, tid) is None
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in res.spawned]
+        assert tid not in dict(res.respawn_guarded)
+
+
+def test_active_pr_ignores_bystander_comment_without_a_run(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _guard_env(monkeypatch)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="fix it", assignee="builder",
+                             created_by="user")
+        kb.add_comment(conn, tid, author="orchestrator", body=_SPEC_PR)
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_active_pr_creator_who_is_assignee_counts_only_after_its_run_started(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _guard_env(monkeypatch)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="self brief", assignee="builder",
+                             created_by="builder")
+        kb.add_comment(conn, tid, author="builder", body=_SPEC_PR)
+        _backdate_comments(conn, tid, seconds=120)
+        # Brief written before any run: an input, not evidence.
+        assert kbd.check_respawn_guard(conn, tid) is None
+        # Once builder has run the card, its own PR comment is evidence.
+        _insert_run(conn, tid, "builder", started_offset=-60)
+        kb.add_comment(conn, tid, author="builder",
+                       body="Opened https://github.com/example/repo/pull/75")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_counts_comment_by_profile_that_ran_the_card(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A previous worker that is no longer the assignee still counts, so the
+    duplicate-PR protection survives an unassign (no handoff to a new owner)."""
+    _guard_env(monkeypatch)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="impl", assignee="dev", created_by="user")
+        _insert_run(conn, tid, "dev", started_offset=-60)
+        kb.add_comment(conn, tid, author="dev",
+                       body="Opened https://github.com/example/repo/pull/9")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_counts_pr_link_in_run_summary(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _guard_env(monkeypatch)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="impl", assignee="dev", created_by="user")
+        _insert_run(conn, tid, "dev", started_offset=-60,
+                    summary="done, see https://github.com/example/repo/pull/12")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_run_summary_evidence_lifts_on_later_handoff(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _guard_env(monkeypatch)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="impl", assignee="dev", created_by="user")
+        _insert_run(conn, tid, "dev", started_offset=-120,
+                    metadata='{"pr": "https://github.com/example/repo/pull/13"}')
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        assert kb.assign_task(conn, tid, "closer") is True
+        assert kbd.check_respawn_guard(conn, tid) is None
