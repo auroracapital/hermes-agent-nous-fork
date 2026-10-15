@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from tests.slack_egress_fixture import slack_egress_broker  # noqa: F401
 
 from gateway.config import PlatformConfig
 from gateway.relay.adapter import RelayAdapter
@@ -83,8 +84,10 @@ async def run_progress(adapter, metadata, reply_to, after_first=None):
     ("relay", {}, "100.1", True),
 ])
 async def test_destination_preflight_survives_transport_recovery(
-    monkeypatch, kind, metadata, reply_to, eligible,
+    monkeypatch, kind, metadata, reply_to, eligible, slack_egress_broker,
 ):
+    if kind == "native" and eligible:
+        slack_egress_broker.grant("D1", "Hermes is working\n- terminal - complete")
     adapter, io = make_adapter(kind, monkeypatch)
     original_metadata = dict(metadata)
     stop = AsyncMock(wraps=adapter.stop_native_task_card_progress)

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from tests.slack_egress_fixture import slack_egress_broker  # noqa: F401
 
 from agent.status_output import StatusOutputMixin
 from gateway.config import Platform, PlatformConfig
@@ -26,7 +27,7 @@ from tests.gateway.relay.stub_connector import StubConnector
 @pytest.mark.parametrize("relay", [False, True])
 @pytest.mark.parametrize("thread_id", [None, "1700.1"])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_warning_policy_reaches_slack_transport(tmp_path, monkeypatch, relay, thread_id, enabled):
+def test_warning_policy_reaches_slack_transport(tmp_path, monkeypatch, relay, thread_id, enabled, slack_egress_broker):
     from gateway import run
 
     (tmp_path / "config.yaml").write_text(f"display: {{suppress_warning_notifications: {str(not enabled).lower()}}}")
@@ -65,10 +66,14 @@ def test_warning_policy_reaches_slack_transport(tmp_path, monkeypatch, relay, th
     agent = StatusOutputMixin()
     agent.suppress_status_output = True
     agent.status_callback = turn._status_callback_sync
+    if not relay and enabled:
+        slack_egress_broker.grant("D1", "⚠ Context is over the limit; compression blocked")
     for _ in range(2):
         agent._emit_warning("⚠ Context is over the limit; compression blocked")
     assert len(sent) == (2 if enabled else 0)
     # A warning-looking real answer remains deliverable through the identical adapter.
+    if not relay:
+        slack_egress_broker.grant("D1", "⚠ The requested task failed")
     result = asyncio.run(adapter.send("D1", "⚠ The requested task failed", metadata=metadata))
     assert result.success
     assert len(sent) == (2 if enabled else 0) + 1
