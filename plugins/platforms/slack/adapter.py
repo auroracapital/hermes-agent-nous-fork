@@ -2209,7 +2209,9 @@ class SlackAdapter(BasePlatformAdapter):
             text=str(kwargs.get("text") or ""),
             attachment=str(kwargs.get("filename") or ""),
             approved=bool(kwargs.pop("_egress_approved", False)),
-            tool_name=method,
+            # The SDK uses underscores; the broker's closed allowlist uses
+            # Slack API names. Do not normalize arbitrary/unknown methods.
+            tool_name={"chat_postMessage": "chat.postMessage", "chat_update": "chat.update"}.get(method, method),
         )
         try:
             result = await getattr(client_fn(), method)(**kwargs)
