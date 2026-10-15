@@ -10,6 +10,7 @@ Verifies the opt-in behaviour contract:
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from tests.slack_egress_fixture import slack_egress_broker  # noqa: F401
 
 from gateway.config import PlatformConfig
 from plugins.platforms.slack.adapter import SlackAdapter
@@ -36,6 +37,10 @@ RICH_TABLE_MD = (
 )
 
 
+RICH_TEXT = "*Title*\n\n- a\n  - nested\n\n---\n\nbody text"
+RICH_TABLE_TEXT = "```\n| Item   | Status | Note  |\n| ------ | ------ | ----- |\n| Hermes | ok     | table |\n```"
+
+
 class SlackRejectedBlocks(Exception):
     def __init__(self, error="invalid_blocks"):
         super().__init__(f"Slack API rejected blocks: {error}")
@@ -58,7 +63,8 @@ def _slack_connection_key():
 
 class TestSendMessageBlocks:
     @pytest.mark.asyncio
-    async def test_disabled_by_default_no_blocks(self):
+    async def test_disabled_by_default_no_blocks(self, slack_egress_broker):
+        slack_egress_broker.grant("C1", RICH_TEXT)
         adapter, client = _make_adapter()
         await adapter.send("C1", RICH_MD)
         kwargs = client.chat_postMessage.await_args.kwargs
@@ -66,7 +72,8 @@ class TestSendMessageBlocks:
         assert kwargs["text"]  # plain text still sent
 
     @pytest.mark.asyncio
-    async def test_unfurl_config_suppresses_previews_without_changing_link_text(self):
+    async def test_unfurl_config_suppresses_previews_without_changing_link_text(self, slack_egress_broker):
+        slack_egress_broker.grant("C1", "<https://example.com/hermes|Hermes>")
         adapter, client = _make_adapter(
             {"unfurl_links": False, "unfurl_media": False}
         )
@@ -81,7 +88,8 @@ class TestSendMessageBlocks:
 
 
     @pytest.mark.asyncio
-    async def test_enabled_but_unrenderable_falls_back_to_text(self):
+    async def test_enabled_but_unrenderable_falls_back_to_text(self, slack_egress_broker):
+        slack_egress_broker.grant("C1", "\n\n".join(["---"] * 60))
         # 60 dividers -> renderer returns None -> no blocks kwarg, text stands
         adapter, client = _make_adapter({"rich_blocks": True})
         await adapter.send("C1", "\n\n".join(["---"] * 60))
@@ -91,7 +99,8 @@ class TestSendMessageBlocks:
 
 
     @pytest.mark.asyncio
-    async def test_feedback_buttons_opt_in_appended_to_blocks(self):
+    async def test_feedback_buttons_opt_in_appended_to_blocks(self, slack_egress_broker):
+        slack_egress_broker.grant("C1", "final answer")
         adapter, client = _make_adapter({"rich_blocks": True, "feedback_buttons": True})
 
         await adapter.send("C1", "final answer")
@@ -105,7 +114,8 @@ class TestSendMessageBlocks:
 
 class TestEditMessageBlocks:
     @pytest.mark.asyncio
-    async def test_intermediate_edit_no_blocks(self):
+    async def test_intermediate_edit_no_blocks(self, slack_egress_broker):
+        slack_egress_broker.grant("C1", RICH_TEXT)
         adapter, client = _make_adapter({"rich_blocks": True})
         await adapter.edit_message("C1", "111.222", RICH_MD, finalize=False)
         kwargs = client.chat_update.await_args.kwargs
@@ -113,7 +123,8 @@ class TestEditMessageBlocks:
         assert kwargs["text"]
 
     @pytest.mark.asyncio
-    async def test_finalize_edit_gets_blocks(self):
+    async def test_finalize_edit_gets_blocks(self, slack_egress_broker):
+        slack_egress_broker.grant("C1", RICH_TEXT)
         adapter, client = _make_adapter({"rich_blocks": True})
         await adapter.edit_message("C1", "111.222", RICH_MD, finalize=True)
         kwargs = client.chat_update.await_args.kwargs
@@ -122,7 +133,8 @@ class TestEditMessageBlocks:
 
 
     @pytest.mark.asyncio
-    async def test_block_rejection_retries_edit_without_blocks_using_workspace_client(self):
+    async def test_block_rejection_retries_edit_without_blocks_using_workspace_client(self, slack_egress_broker):
+        slack_egress_broker.grant("C1", RICH_TABLE_TEXT)
         adapter, client = _make_adapter({"rich_blocks": True})
         client.chat_update = AsyncMock(
             side_effect=[SlackRejectedBlocks("invalid_blocks"), {"ts": "111.222"}]
@@ -149,7 +161,8 @@ class TestEditMessageBlocks:
         assert second["text"]
 
     @pytest.mark.asyncio
-    async def test_timeout_error_on_edit_is_retryable_transient(self):
+    async def test_timeout_error_on_edit_is_retryable_transient(self, slack_egress_broker):
+        slack_egress_broker.grant("C1", RICH_TEXT)
         adapter, client = _make_adapter()
         client.chat_update = AsyncMock(side_effect=TimeoutError("timed out"))
 
@@ -171,7 +184,8 @@ class TestMarkdownBlockMode:
 
 
     @pytest.mark.asyncio
-    async def test_enabled_sends_markdown_block_with_raw_content(self):
+    async def test_enabled_sends_markdown_block_with_raw_content(self, slack_egress_broker):
+        slack_egress_broker.grant("C1", RICH_TABLE_TEXT)
         adapter, client = _make_adapter({"markdown_blocks": True})
         await adapter.send("C1", RICH_TABLE_MD)
         kwargs = client.chat_postMessage.await_args.kwargs
@@ -184,7 +198,8 @@ class TestMarkdownBlockMode:
 
 
     @pytest.mark.asyncio
-    async def test_edit_finalize_uses_markdown_block(self):
+    async def test_edit_finalize_uses_markdown_block(self, slack_egress_broker):
+        slack_egress_broker.grant("C1", RICH_TABLE_TEXT)
         adapter, client = _make_adapter({"markdown_blocks": True})
         await adapter.edit_message("C1", "111.222", RICH_TABLE_MD, finalize=True)
         kwargs = client.chat_update.await_args.kwargs

@@ -13,6 +13,7 @@ import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.slack_egress_fixture import slack_egress_broker  # noqa: F401
 
 
 def _ensure_slack_mock():
@@ -73,7 +74,9 @@ METADATA = {"thread_id": "1784585355.415219"}
 
 
 @pytest.mark.asyncio
-async def test_distinct_keys_do_not_crosstalk(adapter):
+async def test_distinct_keys_do_not_crosstalk(adapter, slack_egress_broker):
+    slack_egress_broker.grant("C_CHAN", "compressing")
+    slack_egress_broker.grant("C_CHAN", "falling back")
     await adapter.send_or_update_status(
         "C_CHAN", "context_pressure", "compressing", metadata=METADATA
     )
