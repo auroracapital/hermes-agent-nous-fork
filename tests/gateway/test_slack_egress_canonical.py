@@ -52,3 +52,21 @@ def test_missing_broker_still_denies(monkeypatch, tmp_path):
     monkeypatch.setenv("SLACK_EGRESS_BROKER_SOCK", "/tmp/nonexistent-hermes-canonical-test.sock")
     with pytest.raises(EgressDenied, match="broker unreachable"):
         claim("C1", "C1", "text", approved=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["chat_postMessage", "chat_update"])
+async def test_uncertain_sdk_failure_never_reopens_consumed_grant(slack_egress_broker, method):
+    """A lost SDK reply is not proof of no effect and cannot authorize a replay."""
+    adapter = object.__new__(SlackAdapter)
+    call = AsyncMock(side_effect=RuntimeError("synthetic lost reply"))
+    client = SimpleNamespace(**{method: call})
+    payload = {"channel": "C1", "text": "approved text"}
+    slack_egress_broker.grant("C1", "approved text")
+    with pytest.raises(RuntimeError, match="synthetic lost reply"):
+        await adapter._call_with_block_fallback(lambda: client, method, dict(payload), "send")
+    # Recording the same approval again must not reset a consumed fingerprint.
+    slack_egress_broker.grant("C1", "approved text")
+    with pytest.raises(EgressDenied, match="already consumed"):
+        await adapter._call_with_block_fallback(lambda: client, method, dict(payload), "send")
+    assert call.await_count == 1
