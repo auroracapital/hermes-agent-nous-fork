@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from plugins.platforms.slack.adapter import _standalone_send
+from tests.slack_egress_fixture import slack_egress_broker  # noqa: F401
 
 
 def _pconfig(token: str = "xoxb-test"):
@@ -87,8 +88,10 @@ def _fake_slack_sdk(client):
                 sys.modules[name] = prev
 
 
-def test_text_plus_pdf_uploads_via_files_upload_v2():
+def test_text_plus_pdf_uploads_via_files_upload_v2(slack_egress_broker):
     pdf = _tmpfile(".pdf")
+    slack_egress_broker.grant("C012AB3CD", "Here is the report")
+    slack_egress_broker.grant("C012AB3CD", "", os.path.basename(pdf))
     client = _mock_client()
     try:
         with _fake_slack_sdk(client):
@@ -113,8 +116,9 @@ def test_text_plus_pdf_uploads_via_files_upload_v2():
         os.unlink(pdf)
 
 
-def test_media_only_skips_text_post():
+def test_media_only_skips_text_post(slack_egress_broker):
     pdf = _tmpfile(".pdf")
+    slack_egress_broker.grant("C012AB3CD", "", os.path.basename(pdf))
     client = _mock_client()
     try:
         with _fake_slack_sdk(client):

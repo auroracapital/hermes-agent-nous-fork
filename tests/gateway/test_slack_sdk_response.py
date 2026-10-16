@@ -16,6 +16,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.slack_egress_fixture import slack_egress_broker  # noqa: F401
 
 
 # Import the real response class first: the mock installer below fills
@@ -216,10 +217,11 @@ class TestSendPaths:
         assert "channel_not_found" in result.error
 
     @response_shape
-    def test_upload_returns_the_message_id(self, make_response, tmp_path):
+    def test_upload_returns_the_message_id(self, make_response, tmp_path, slack_egress_broker):
         """A lost message_id breaks threading of follow-up sends."""
         media = tmp_path / "note.txt"
         media.write_text("x", encoding="utf-8")
+        slack_egress_broker.grant("C_GEN", "", "note.txt")
         client = MagicMock()
         client.files_upload_v2 = AsyncMock(
             return_value=make_response(
@@ -236,9 +238,10 @@ class TestSendPaths:
         }
 
     @response_shape
-    def test_upload_error_is_surfaced(self, make_response, tmp_path):
+    def test_upload_error_is_surfaced(self, make_response, tmp_path, slack_egress_broker):
         media = tmp_path / "note.txt"
         media.write_text("x", encoding="utf-8")
+        slack_egress_broker.grant("C_GEN", "", "note.txt")
         client = MagicMock()
         client.files_upload_v2 = AsyncMock(
             return_value=make_response({"ok": False, "error": "not_in_channel"})
@@ -307,10 +310,12 @@ class TestStandaloneSendMediaPath:
     """``_standalone_send``'s media branch reads two chat.postMessage replies."""
 
     @response_shape
-    def test_text_alongside_media_reports_its_ts(self, make_response, tmp_path):
+    def test_text_alongside_media_reports_its_ts(self, make_response, tmp_path, slack_egress_broker):
         """The text post's ts is the message_id cron threads follow-ups onto."""
         media = tmp_path / "report.pdf"
         media.write_bytes(b"%PDF-1.4 x")
+        slack_egress_broker.grant("C_GEN", "Here is the report")
+        slack_egress_broker.grant("C_GEN", "", "report.pdf")
         client = MagicMock()
         client.chat_postMessage = AsyncMock(
             return_value=make_response({"ok": True, "ts": "111.222"})
@@ -331,10 +336,11 @@ class TestStandaloneSendMediaPath:
         assert result["message_id"] == "111.222"
 
     @response_shape
-    def test_text_post_error_is_surfaced(self, make_response, tmp_path):
+    def test_text_post_error_is_surfaced(self, make_response, tmp_path, slack_egress_broker):
         """A rejected text post must fail loudly instead of silently uploading."""
         media = tmp_path / "report.pdf"
         media.write_bytes(b"%PDF-1.4 x")
+        slack_egress_broker.grant("C_GEN", "Here is the report")
         client = MagicMock()
         client.chat_postMessage = AsyncMock(
             return_value=make_response({"ok": False, "error": "channel_not_found"})
@@ -354,11 +360,13 @@ class TestStandaloneSendMediaPath:
 
     @response_shape
     def test_caption_with_unfurl_controls_posts_text_separately(
-        self, make_response, tmp_path
+        self, make_response, tmp_path, slack_egress_broker
     ):
         """Upload comments cannot carry unfurl flags, so configured text is separate."""
         media = tmp_path / "report.pdf"
         media.write_bytes(b"%PDF-1.4 x")
+        slack_egress_broker.grant("C_GEN", "<https://example.com/report|Report>")
+        slack_egress_broker.grant("C_GEN", "", "report.pdf")
         client = MagicMock()
         client.chat_postMessage = AsyncMock(
             return_value=make_response({"ok": True, "ts": "111.222"})
@@ -389,9 +397,10 @@ class TestStandaloneSendMediaPath:
 
     @response_shape
     def test_caption_fallback_delivers_when_media_is_missing(
-        self, make_response, tmp_path
+        self, make_response, tmp_path, slack_egress_broker
     ):
         """Caption-only delivery was reported as 'nothing deliverable' instead."""
+        slack_egress_broker.grant("C_GEN", "Here is the report")
         client = MagicMock()
         client.chat_postMessage = AsyncMock(
             return_value=make_response({"ok": True, "ts": "555.666"})

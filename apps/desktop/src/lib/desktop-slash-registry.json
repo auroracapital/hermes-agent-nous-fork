@@ -106,6 +106,7 @@
   "/subscription": null,
   "/suggest": null,
   "/suggestions": null,
+  "/takeover": "advanced",
   "/tasks": null,
   "/timestamps": null,
   "/title": null,
