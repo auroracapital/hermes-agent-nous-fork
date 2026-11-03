@@ -100,7 +100,10 @@ class BrokerProc:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
-        subprocess.run(["sudo", "-n", "rm", "-rf", str(self.base)], check=False)
+        subprocess.run(
+            ["sudo", "-n", "rm", "-rf", str(self.base)],
+            check=False, stdin=subprocess.DEVNULL,
+        )
 
     def marker(self, word: str):
         path = self.state / "stop-marker"

@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
+from tests.slack_egress_fixture import slack_egress_broker  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +85,9 @@ def _slack_api_error(status_code: int, retry_after: str = None):
 
 class TestSlackSendRetryable:
     @pytest.mark.asyncio
-    async def test_429_returns_retryable_with_retry_after(self):
+    async def test_429_returns_retryable_with_retry_after(self, slack_egress_broker):
         adapter = _make_adapter()
+        slack_egress_broker.grant("C123", "hello")
         client = AsyncMock()
         client.chat_postMessage = AsyncMock(
             side_effect=_slack_api_error(429, retry_after="30")
@@ -99,8 +101,9 @@ class TestSlackSendRetryable:
 
 
     @pytest.mark.asyncio
-    async def test_500_is_retryable_no_retry_after(self):
+    async def test_500_is_retryable_no_retry_after(self, slack_egress_broker):
         adapter = _make_adapter()
+        slack_egress_broker.grant("C123", "hello")
         client = AsyncMock()
         client.chat_postMessage = AsyncMock(
             side_effect=_slack_api_error(500)
@@ -113,10 +116,11 @@ class TestSlackSendRetryable:
         assert result.retry_after is None
 
     @pytest.mark.asyncio
-    async def test_edit_api_failure_logs_the_slack_error_code(self, caplog):
+    async def test_edit_api_failure_logs_the_slack_error_code(self, caplog, slack_egress_broker):
         """HTTP 200 + ok=false must name the body error code, not read as a transport failure
         (#111931)."""
         adapter = _make_adapter()
+        slack_egress_broker.grant("C123", "hello")
         error = _slack_api_error(200)
         error.response.data = {"ok": False, "error": "message_not_found"}
         client = AsyncMock()

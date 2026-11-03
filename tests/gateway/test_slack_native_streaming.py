@@ -35,6 +35,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.slack_egress_fixture import slack_egress_broker  # noqa: F401
 
 from gateway.config import PlatformConfig
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
@@ -261,7 +262,8 @@ class TestSendFinalization:
 
 
     @pytest.mark.asyncio
-    async def test_unrelated_send_passes_through(self):
+    async def test_unrelated_send_passes_through(self, slack_egress_broker):
+        slack_egress_broker.grant("D1", "Unrelated notice")
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "Streaming text here", metadata=META)
         result = await adapter.send("D1", "Unrelated notice", metadata=META)
@@ -271,7 +273,8 @@ class TestSendFinalization:
         assert _open_streams(adapter)
 
     @pytest.mark.asyncio
-    async def test_mid_turn_notify_reply_leaves_stream_open_and_posts_fresh(self):
+    async def test_mid_turn_notify_reply_leaves_stream_open_and_posts_fresh(self, slack_egress_broker):
+        slack_egress_broker.grant("D1", "Status: running, 3 tools")
         """/status, /approve and clarify answers are notify sends in the SAME thread; they
         must not overwrite the half-streamed answer in place."""
         adapter, client = _make_adapter()
@@ -286,7 +289,8 @@ class TestSendFinalization:
 
 
     @pytest.mark.asyncio
-    async def test_stop_and_update_both_fail_falls_back_to_fresh_post(self):
+    async def test_stop_and_update_both_fail_falls_back_to_fresh_post(self, slack_egress_broker):
+        slack_egress_broker.grant("D1", "Hello world")
         """C2/D: an uncommittable stream still delivers the answer (loss-safe)."""
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "Hello", metadata=META)
@@ -320,7 +324,8 @@ class TestSendFinalization:
 
 
     @pytest.mark.asyncio
-    async def test_rewritten_turn_final_replaces_stream_in_place(self):
+    async def test_rewritten_turn_final_replaces_stream_in_place(self, slack_egress_broker):
+        slack_egress_broker.grant("D1", "_Done:_ all good")
         """A mrkdwn-rewritten turn-final (notify=True) replaces the sealed stream; no 2nd post."""
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "*Done:* all good", metadata=META)
@@ -333,7 +338,8 @@ class TestSendFinalization:
         assert not _open_streams(adapter)
 
     @pytest.mark.asyncio
-    async def test_rewritten_turn_final_posts_when_update_fails(self):
+    async def test_rewritten_turn_final_posts_when_update_fails(self, slack_egress_broker):
+        slack_egress_broker.grant("D1", "_Draft:_ answer that got restyled")
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "*Draft:* answer that got restyled", metadata=META)
         client.chat_update = AsyncMock(side_effect=Exception("update failed"))
@@ -351,7 +357,8 @@ class TestRichBlocksAfterSeal:
 
 
     @pytest.mark.asyncio
-    async def test_rich_blocks_applied_after_seal(self):
+    async def test_rich_blocks_applied_after_seal(self, slack_egress_broker):
+        slack_egress_broker.grant("D1", "*Title*\n\nbody text")
         adapter, client = _make_adapter({"rich_blocks": True})
         rich = "# Title\n\nbody text"
         await adapter.send_draft("D1", 7, rich[:5], metadata=META)

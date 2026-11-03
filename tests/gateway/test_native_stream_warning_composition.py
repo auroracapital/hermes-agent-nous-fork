@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from tests.slack_egress_fixture import slack_egress_broker  # noqa: F401
 from agent.status_output import StatusOutputMixin
 from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
@@ -15,11 +16,21 @@ from tests.gateway.test_slack_native_streaming import _make_adapter, _open_strea
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("setting", [None, False, True])
-async def test_warning_and_media_failure_do_not_seal_requested_final(tmp_path, monkeypatch, setting):
+async def test_warning_and_media_failure_do_not_seal_requested_final(tmp_path, monkeypatch, setting, slack_egress_broker):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
     cfg = {} if setting is None else {"display": {"suppress_warning_notifications": setting}}
     (tmp_path / "config.yaml").write_text(json.dumps(cfg))
+    if setting is not True:
+        slack_egress_broker.grant(
+            "D1", "⚠️ Session context (~200 tokens) exceeds the model "
+            "context window (~100 tokens) with compression disabled "
+            "(compression.enabled: false). Use /compact to compress history or "
+            "enable compression in config.yaml.",
+        )
+        slack_egress_broker.grant(
+            "D1", "⚠️ Couldn't deliver the file attachment (fixture.pdf).",
+        )
     adapter, client = _make_adapter()
     first = await adapter.send_draft("D1", 7, "Requested", metadata=META)
     assert first.success
