@@ -1447,13 +1447,17 @@ def _run_cron_cleanup_with_timeout(
 
 
 class _BoundedCronSessionDB:
-    """Proxy SessionDB cleanup calls through the cron cleanup timeout; after the first failure or
-    timeout all later calls fail immediately (a damaged connection leaks at most one worker)."""
+    """Bound cleanup calls; after an uncertain timeout, preserve its cause and fail fast."""
 
     def __init__(self, session_db, job_id: str):
+        # The finalizer is synchronous. The async facade only offloads to the inner SessionDB, so use
+        # that store: the write fence then covers the real writer and no coroutine is left unawaited.
+        from hermes_state import sync_session_db
+        session_db = sync_session_db(session_db)
         self._session_db = session_db
         self._job_id = job_id
         self._disabled = False
+        self._primary_timeout = None
 
     def __getattr__(self, name):
         target = getattr(self._session_db, name)
@@ -1462,11 +1466,25 @@ class _BoundedCronSessionDB:
 
         def _bounded(*args, **kwargs):
             if self._disabled:
-                raise RuntimeError("session finalization disabled after prior cleanup failure")
+                raise self._primary_timeout
 
             result = {}
+            token = None
+            bind_thread = None
+            import inspect
+            if inspect.iscoroutinefunction(target):
+                raise TypeError(
+                    f"cron session finalization is synchronous; async store method {name} is unsupported")
+            from hermes_state import SessionDB as _FenceSessionDB
+            if isinstance(self._session_db, _FenceSessionDB):
+                fence = getattr(self._session_db, "arm_commit_fence", None)
+                armed = fence() if callable(fence) else None
+                if isinstance(armed, tuple):
+                    token, bind_thread = armed
 
             def _call():
+                if callable(bind_thread):
+                    bind_thread()
                 try:
                     result["value"] = target(*args, **kwargs)
                 except BaseException as exc:
@@ -1476,12 +1494,19 @@ class _BoundedCronSessionDB:
             ok = _run_cron_cleanup_with_timeout(
                 _call, job_id=self._job_id, label=f"session finalization ({name})")
             if not ok:
+                if token is not None:
+                    cancel = getattr(self._session_db, "cancel_commit_fence", None)
+                    if callable(cancel):
+                        cancel(token)
                 error = result.get("error")
                 if error is not None:
                     raise error
-                # No error yet not complete == timeout: disable so later steps fail fast.
                 self._disabled = True
-                raise TimeoutError(f"session finalization method {name} timed out")
+                self._primary_timeout = TimeoutError(f"session finalization method {name} timed out")
+                raise self._primary_timeout
+            disarm = getattr(self._session_db, "disarm_commit_fence", None) if token is not None else None
+            if callable(disarm) and token is not None:
+                disarm(token)
             return result.get("value")
 
         return _bounded

@@ -598,6 +598,9 @@ class SessionDB(
         finally:
             del caller
         self._lock = threading.Lock()
+        self._commit_fence = None
+        self._fence_holder = None
+        self._fence_cancelled = False
         # Read-path split (WAL only): reads borrow from a BOUNDED read-only pool so they
         # never queue behind writer flushes on self._lock (see _read_ctx); unbounded
         # per-thread connections pinned fds for the process lifetime and hit EMFILE.
@@ -1007,6 +1010,46 @@ class SessionDB(
         if self._wal_active:  # a reopened writer is a live generation holder like the first open
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
+    def arm_commit_fence(self):
+        """Start one generation. The next caller thread owns its commit.
+
+        Pass bind_thread() into the worker that may outlive the bound. Other
+        writers, including a transcript flush that close() reopens, ignore the
+        fence. cancel() makes only that worker roll back.
+        """
+        token = object()
+        self._commit_fence = token
+        self._fence_holder = None
+        self._fence_cancelled = False
+
+        def bind_thread() -> None:
+            if self._commit_fence is token and self._fence_holder is None:
+                self._fence_holder = threading.current_thread()
+
+        return token, bind_thread
+
+    def disarm_commit_fence(self, token) -> None:
+        if self._commit_fence is token and not self._fence_cancelled:
+            self._commit_fence = None
+            self._fence_holder = None
+
+    def cancel_commit_fence(self, token) -> None:
+        if self._commit_fence is token:
+            self._fence_cancelled = True
+
+    def _commit_or_refuse(self, conn) -> None:
+        token = self._commit_fence
+        if token is not None:
+            holder = self._fence_holder
+            if holder is threading.current_thread() and self._fence_cancelled and self._commit_fence is token:
+                self._commit_fence = None
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise TimeoutError("uncertain finalization refused commit")
+        conn.commit()
+
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
     ) -> T:
@@ -1048,7 +1091,7 @@ class SessionDB(
                     try:
                         fn_started = True
                         result = fn(self._conn)
-                        self._conn.commit()
+                        self._commit_or_refuse(self._conn)
                     except BaseException:
                         try:
                             self._conn.rollback()
@@ -1716,6 +1759,14 @@ class SessionDB(
             "SELECT key, value FROM state_meta WHERE key LIKE ? ESCAPE '\\'", (_escape_like(prefix) + "%",),
         )
         return [(row[0], row[1]) for row in rows]
+
+
+def sync_session_db(session_db):
+    """The synchronous SessionDB behind an async facade, or the store itself."""
+    inner = getattr(session_db, "_db", None)
+    if isinstance(inner, SessionDB):
+        return inner
+    return session_db
 
 
 class AsyncSessionDB:
