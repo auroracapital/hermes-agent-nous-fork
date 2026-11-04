@@ -384,6 +384,8 @@ def finish_text_response(
         final_response = None
         return _verdict("continue")
 
+    final_response = _sg.final_response
+
     # Plugins rewrite the reply BEFORE it is appended and flushed: SQLite treats a non-blank
     # assistant row as settled, so a transform after this write would reach the user but never
     # the stored/replayed transcript (#44239). finalize_turn reads the recorded outcome; like

@@ -637,6 +637,16 @@ def finalize_turn(
         logger=logger,
     )
 
+    # The todo continuation cap is a safe stop, not successful completion.
+    # Keep the checklist intact and persist a visible incomplete outcome.
+    # A real iteration-limit wait keeps its own text; that check lives in
+    # bounded_incomplete_outcome.
+    if not interrupted:
+        from agent.own_todo_stop import bounded_incomplete_outcome
+        final_response, _turn_exit_reason = bounded_incomplete_outcome(
+            agent, final_response, _turn_exit_reason
+        )
+
     # A non-interrupted turn that fell out of the loop after a tool result, with no
     # follow-up assistant text, is the Desktop/TUI "silent stop" (#55316, #54756): the
     # composer returns to ready (or keeps spinning) while the durable transcript ends

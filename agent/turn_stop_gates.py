@@ -199,6 +199,34 @@ def apply_stop_gates(
         logger.debug("pre_verify nudge issued (attempt %d)", agent._pre_verify_nudges)
         return verdict
 
+    # Ordinary sessions must not silently end with their own unfinished checklist.
+    # Goal/worker ownership, an explicit interrupt and a real child handoff are
+    # checked inside the guard before it emits a bounded continuation.
+    from agent.own_todo_stop import build_own_todo_nudge
+    _todo_nudge = build_own_todo_nudge(agent)
+    if _todo_nudge:
+        agent._todo_stop_nudges = getattr(agent, "_todo_stop_nudges", 0) + 1
+        final_msg["finish_reason"] = "unfinished_todos_continue"
+        _append_interim_answer(
+            agent, final_msg, messages, conversation_history, "todo interim flush failed"
+        )
+        return _continue(_todo_nudge, "_own_todo_stop_synthetic")
+
+    if getattr(agent, "_todo_stop_incomplete", False):
+        from agent.own_todo_stop import INCOMPLETE_NOTICE
+        # Shape the durable row before the first flush. SQLite treats a
+        # non-blank assistant row as settled, so writing the notice later
+        # would keep the model's "done" claim in the transcript.
+        if "api_content" in final_msg:
+            final_msg["api_content"] = INCOMPLETE_NOTICE
+        else:
+            final_msg["content"] = INCOMPLETE_NOTICE
+        return StopGateVerdict(
+            continue_turn=False, final_response=INCOMPLETE_NOTICE,
+            pending_verification_response=None,
+            pending_verification_response_previewed=False,
+        )
+
     _kanban_nudge = _kanban_stop_nudge(agent, messages)
     if _kanban_nudge:
         agent._kanban_stop_nudges = getattr(agent, "_kanban_stop_nudges", 0) + 1
