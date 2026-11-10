@@ -214,7 +214,7 @@ def pending_admissions_by_session(db, session_ids: list[str]) -> dict[str, list[
             + ") AND status IN ('queued','started','unknown') "
             "ORDER BY target_session_id, seq"
         )
-        with db._read_ctx() as conn:
+        with db._read_ctx(reopen=False) as conn:
             rows = conn.execute(sql, chunk).fetchall()
         for row in rows:
             parsed = _row(row)

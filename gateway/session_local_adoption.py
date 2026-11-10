@@ -58,11 +58,70 @@ async def adopt_before_restore(authority, sid, *, tracked=True):
         logger.warning('Local session %s compression catch-up failed: %s', sid, exc.reason)
 
 
+def _due_many(authority, session_ids):
+    """Ids in *session_ids* whose compression catch-up would commit, read on this turn.
+
+    Receipt JSON is one query per chunk. A tip that is not ended ``compression`` cannot have an
+    adoptable child (``_CHAIN_STEP_SQL`` requires that), so the per-tip walk runs only for those
+    parents. The result is used before the next await.
+    """
+    from gateway.session_local_recovery import owned_receipt
+    from hermes_state_local import local_receipts
+    from hermes_state_local_lineage import adoptable_compression
+    receipts = local_receipts(authority.db, session_ids)
+    candidates = []
+    for sid in session_ids:
+        receipt = receipts.get(sid)
+        if not isinstance(receipt, dict):
+            continue
+        try:
+            tip = receipt['entry']['session_id']
+        except (KeyError, TypeError):
+            continue
+        if isinstance(tip, str) and tip:
+            candidates.append((sid, tip))
+    if not candidates:
+        return []
+    compressed = set()
+    tips = [tip for _sid, tip in candidates]
+    for start in range(0, len(tips), 400):
+        chunk = tips[start:start + 400]
+        placeholders = ",".join("?" * len(chunk))
+        with authority.db._read_ctx(reopen=False) as conn:
+            rows = conn.execute(
+                f"SELECT id FROM sessions WHERE end_reason='compression' AND id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+        compressed.update(row[0] for row in rows)
+    due = []
+    for sid, tip in candidates:
+        if tip not in compressed:
+            continue
+        try:
+            receipt = owned_receipt(authority, sid, receipt=receipts[sid])[0]
+            with authority.db._read_ctx(reopen=False) as conn:
+                adoptable = adoptable_compression(conn, receipt)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if adoptable is not None:
+            due.append(sid)
+    return due
+
+
 async def adopt_local_compressions(authority):
-    """Boot and hot-profile recovery: every receipt's due catch-up, before ``recover_local_sessions``."""
-    from gateway.session_local_recovery import local_receipt_ids
-    for sid in local_receipt_ids(authority):
-        await adopt_before_restore(authority, sid, tracked=False)
+    """Boot and hot-profile recovery: every receipt's due catch-up, before ``recover_local_sessions``.
+
+    The id list is read in a worker. Each batch's due check runs on this loop and is consumed
+    before the next ``sleep(0)``, so a hot-serve of many receipts still answers liveness probes.
+    """
+    from gateway.session_local_recovery import _recovery_batches, local_receipt_ids
+    ids = await asyncio.to_thread(local_receipt_ids, authority)
+    chunks = list(_recovery_batches(ids))
+    for index, chunk in enumerate(chunks):
+        for sid in _due_many(authority, chunk):
+            await adopt_before_restore(authority, sid, tracked=False)
+        if index + 1 < len(chunks):
+            await asyncio.sleep(0)
 
 
 def schedule_adoption(authority, sid, receipt):

@@ -361,7 +361,7 @@ def reset_local_session(store, old_entry, session_id, now, display_name):
 
 
 def local_receipt_ids(authority):
-    with authority.db._read_ctx() as conn:
+    with authority.db._read_ctx(reopen=False) as conn:
         return [row[0][len(POLICY_PREFIX):] for row in conn.execute(
             'SELECT key FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',))]
 
@@ -378,8 +378,11 @@ def _recovery_batches(items):
 
 
 def _prefetch_recovery_batch(authority, session_ids):
-    """Receipts and pending admissions for *session_ids*, in that order. Off the loop this is one
-    read per chunk instead of two queries per session."""
+    """Receipts and pending admissions for *session_ids*, in that order.
+
+    One query per chunk, not one per session. Called on the loop immediately before the batch
+    is applied: an await between the read and the restore lets another task reset, compress or
+    close a receipt, and the stale copy would undo that."""
     receipts = local_receipts(authority.db, session_ids)
     pending = pending_admissions_by_session(authority.db, session_ids)
     return [(sid, receipts.get(sid, _LOAD_RECEIPT)) for sid in session_ids], pending
@@ -418,10 +421,22 @@ def _rearm_persisted_closes(authority):
     return armed
 
 
-def _log_recovery_progress(done, total, started):
-    if total > _RECOVERY_BATCH:
-        _recovery_log.info(
-            'Local session recovery %d/%d in %.1fs', done, total, time.monotonic() - started)
+# Log when another tenth of the scan has finished, or 5s has passed, whichever is first.
+_PROGRESS_FRACTION = 0.10
+_PROGRESS_INTERVAL_S = 5.0
+
+
+def _log_recovery_progress(done, total, started, state):
+    if total <= _RECOVERY_BATCH or done <= 0:
+        return
+    elapsed = time.monotonic() - started
+    tenth = (done - state['logged_done']) >= total * _PROGRESS_FRACTION
+    waited = (elapsed - state['logged_at']) >= _PROGRESS_INTERVAL_S
+    if not (tenth or waited):
+        return
+    _recovery_log.info('Local session recovery %d/%d in %.1fs', done, total, elapsed)
+    state['logged_done'] = done
+    state['logged_at'] = elapsed
 
 
 def _log_recovery_finished(total, started):
@@ -434,18 +449,18 @@ def _log_recovery_finished(total, started):
 def recover_local_sessions(authority, *, schedule=False):
     """Restore every receipt, in ``local_receipt_ids`` order.
 
-    Synchronous: authority bring-up does not yield, so nothing else observes a half-restored
-    registry. Startup and hot-serve use :func:`recover_local_sessions_async`, which yields
-    between batches so the loop answers liveness probes."""
+    Synchronous: a caller that must not yield (tests, a publish that is already visible) uses
+    this. Startup and hot-serve use :func:`recover_local_sessions_async`."""
     started = time.monotonic()
     ids = local_receipt_ids(authority)
     total = len(ids)
     done = 0
+    progress = {'logged_done': 0, 'logged_at': 0.0}
     for chunk in _recovery_batches(ids):
         loaded, pending = _prefetch_recovery_batch(authority, chunk)
         _apply_recovery_batch(authority, loaded, pending, schedule=schedule)
         done += len(chunk)
-        _log_recovery_progress(done, total, started)
+        _log_recovery_progress(done, total, started, progress)
     if schedule:
         _rearm_persisted_closes(authority)
     _log_recovery_finished(total, started)
@@ -454,20 +469,23 @@ def recover_local_sessions(authority, *, schedule=False):
 async def recover_local_sessions_async(authority, *, schedule=False):
     """:func:`recover_local_sessions` for a live loop.
 
-    Receipt reads run in a worker. Restores stay on this loop — worker threads hold the session
-    store lock across state.db writes, and a restore on the loop is what avoids that inversion —
-    in batches of ``_RECOVERY_BATCH``, yielding between them so a liveness probe's ``call_soon``
-    runs. The caller awaits this before work that needs the restored registry.
+    The id list is read in a worker. Each batch's receipt and admission rows are read on this
+    loop and applied before the next await, so a reset, compression or close that runs during
+    the yield is what the next batch restores. Restores stay on the loop: worker threads hold
+    the session-store lock across state.db writes. ``asyncio.sleep(0)`` between batches lets a
+    liveness probe's ``call_soon`` run. The caller awaits this before work that needs the
+    restored registry.
     """
     started = time.monotonic()
     ids = await asyncio.to_thread(local_receipt_ids, authority)
     total = len(ids)
     done = 0
+    progress = {'logged_done': 0, 'logged_at': 0.0}
     for chunk in _recovery_batches(ids):
-        loaded, pending = await asyncio.to_thread(_prefetch_recovery_batch, authority, chunk)
+        loaded, pending = _prefetch_recovery_batch(authority, chunk)
         _apply_recovery_batch(authority, loaded, pending, schedule=schedule)
         done += len(chunk)
-        _log_recovery_progress(done, total, started)
+        _log_recovery_progress(done, total, started, progress)
         if done < total:
             await asyncio.sleep(0)
     if schedule:

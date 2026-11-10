@@ -278,7 +278,7 @@ def local_receipts(db, session_ids: list[str]) -> dict[str, dict]:
         chunk = ids[start:start + _RECEIPT_READ_CHUNK]
         keys = [POLICY_PREFIX + sid for sid in chunk]
         placeholders = ",".join("?" * len(keys))
-        with db._read_ctx() as conn:
+        with db._read_ctx(reopen=False) as conn:
             rows = conn.execute(
                 f"SELECT key, value FROM state_meta WHERE key IN ({placeholders})",
                 keys,

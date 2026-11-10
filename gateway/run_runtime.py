@@ -403,8 +403,9 @@ async def serve_profile_runtime(runner, name, home):
         with owner_scope(authority):
             _drop_retired_local_adapter(authority)
             await recover_bot_mailbox(authority)
-            # Awaited: webhook recovery below reads the restored registry. Yields inside
-            # so this profile's scan does not freeze the loop that is already serving others.
+            # Second pass, after ``initialize_session_authority`` already adopted and restored
+            # with the same yielding batches. Awaited so webhook recovery below sees the
+            # registry; each batch yields so the loop serving other profiles answers probes.
             await recover_local_sessions_async(authority, schedule=True)
             await recover_webhook_finalizations(authority)
             _recover_published_api_turns(runner, authority)

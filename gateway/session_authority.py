@@ -1375,8 +1375,9 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     """
     if db is None:
         db = getattr(runner._session_db, '_db', runner._session_db)
-    # Resolved off-loop before any state is published: the rest of the bring-up runs without
-    # yielding, so no other task observes a half-registered authority.
+    # Path resolution and the epoch write stay off the loop. Recovery itself yields, but the
+    # authority is published (``runner.session_authority`` and the cron owner binding) only
+    # after that pass, so a yield cannot expose a half-restored registry.
     from pathlib import Path
     db_key = await asyncio.to_thread(Path(db.db_path).resolve)
     epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=instance_id)
@@ -1392,10 +1393,6 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     # authority is published, so the recovery below only reads.
     from gateway.session_local_adoption import adopt_local_compressions
     await adopt_local_compressions(authority)
-    if register:
-        runner.session_authority = authority
-    from gateway.session_cron import bind_owner
-    bind_owner(authority)
     store = runner.session_store
     if register:
         store._local_authority_epoch = epoch
@@ -1404,6 +1401,10 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     if epochs is None:
         epochs = store._local_authority_epochs = {}
     epochs[db_key] = epoch
-    from gateway.session_local_recovery import recover_local_sessions
-    recover_local_sessions(authority)
+    from gateway.session_local_recovery import recover_local_sessions_async
+    await recover_local_sessions_async(authority)
+    from gateway.session_cron import bind_owner
+    bind_owner(authority)
+    if register:
+        runner.session_authority = authority
     return authority
