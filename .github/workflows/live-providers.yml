@@ -134,4 +134,4 @@ jobs:
             live-junit.xml
             live-usage.jsonl
           if-no-files-found: ignore
-          retention-days: 30
+          retention-days: 14
