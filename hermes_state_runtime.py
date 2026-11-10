@@ -200,6 +200,34 @@ def list_session_admissions(db, *, session_id: str, pending_only: bool = True) -
         return [_row(row) for row in conn.execute(sql, (session_id,))]
 
 
+_ADMISSION_READ_CHUNK = 400
+
+
+def pending_admissions_by_session(db, session_ids: list[str]) -> dict[str, list[dict]]:
+    """Pending admissions for many sessions, grouped and ordered like
+    ``list_session_admissions(..., pending_only=True)``.
+
+    Sessions with none are absent. One query per chunk, not one per session.
+    """
+    grouped: dict[str, list[dict]] = {}
+    ids = [sid for sid in session_ids if isinstance(sid, str) and sid]
+    for start in range(0, len(ids), _ADMISSION_READ_CHUNK):
+        chunk = ids[start:start + _ADMISSION_READ_CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        sql = (
+            "SELECT * FROM session_admissions WHERE target_session_id IN ("
+            + placeholders
+            + ") AND status IN ('queued','started','unknown') "
+            "ORDER BY target_session_id, seq"
+        )
+        with db._read_ctx() as conn:
+            rows = conn.execute(sql, chunk).fetchall()
+        for row in rows:
+            parsed = _row(row)
+            grouped.setdefault(parsed["target_session_id"], []).append(parsed)
+    return grouped
+
+
 _ANY_HEAD = object()
 
 
