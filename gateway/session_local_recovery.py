@@ -2,14 +2,15 @@
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 
 from gateway.config import Platform
 from gateway.session import SessionEntry, SessionSource
 from gateway.session_contract import SessionRef
 from hermes_state_keys import local_identity
-from hermes_state_local import POLICY_PREFIX, local_receipt
-from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from hermes_state_local import POLICY_PREFIX, local_receipt, local_receipts
+from hermes_state_runtime import RuntimeStoreError, pending_admissions_by_session
 
 
 def local_adapter_map(authority):
@@ -98,9 +99,17 @@ def _checked_entry(authority, receipt, source, route):
     return entry
 
 
-def owned_receipt(authority, sid):
-    """*sid*'s stored receipt with its LOCAL source, route and entry, once all are this owner's."""
-    receipt = local_receipt(authority.db, sid)
+# Sentinel: ``owned_receipt`` reads the row itself. A preloaded dict skips that read.
+_LOAD_RECEIPT = object()
+
+
+def owned_receipt(authority, sid, *, receipt=_LOAD_RECEIPT):
+    """*sid*'s stored receipt with its LOCAL source, route and entry, once all are this owner's.
+
+    *receipt*, when passed, is a copy already read for this id (a boot scan shares one query).
+    It is checked the same way as a fresh ``local_receipt``."""
+    if receipt is _LOAD_RECEIPT:
+        receipt = local_receipt(authority.db, sid)
     if receipt['profile_id'] != authority.profile_id:
         raise RuntimeStoreError('profile_mismatch')
     chat_id = (receipt['legacy_session_id'] if 'legacy_session_id' in receipt else
@@ -134,13 +143,13 @@ def _stray_route_target(authority, receipt, session_id):
     return True
 
 
-def restore_local_session(authority, sid):
+def restore_local_session(authority, sid, *, receipt=_LOAD_RECEIPT):
     from gateway.session_authority import LiveSession
     from gateway.session_local import LocalSessionAdapter
     from gateway.session_policy import restore_policy
     try:
         # The catch-up writes, so the receipt as stored must already be this owner's (#140060).
-        receipt, source, route, entry = owned_receipt(authority, sid)
+        receipt, source, route, entry = owned_receipt(authority, sid, receipt=receipt)
         chat_id, store = source.chat_id, authority.runner.session_store
         adopted = _with_untracked_compression(authority, sid, receipt)
         policy = restore_policy(adopted['policy'])
@@ -357,23 +366,124 @@ def local_receipt_ids(authority):
             'SELECT key FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',))]
 
 
-def recover_local_sessions(authority, *, schedule=False):
-    for sid in local_receipt_ids(authority):
+# One batch of restores has to finish inside the loop-liveness probe timeout (10s). A hundred
+# indexed reads does; the loop runs between batches, so a probe's call_soon is answered.
+_RECOVERY_BATCH = 100
+_recovery_log = logging.getLogger(__name__)
+
+
+def _recovery_batches(items):
+    for offset in range(0, len(items), _RECOVERY_BATCH):
+        yield items[offset:offset + _RECOVERY_BATCH]
+
+
+def _prefetch_recovery_batch(authority, session_ids):
+    """Receipts and pending admissions for *session_ids*, in that order. Off the loop this is one
+    read per chunk instead of two queries per session."""
+    receipts = local_receipts(authority.db, session_ids)
+    pending = pending_admissions_by_session(authority.db, session_ids)
+    return [(sid, receipts.get(sid, _LOAD_RECEIPT)) for sid in session_ids], pending
+
+
+def _apply_recovery_batch(authority, loaded, pending_by_sid, *, schedule):
+    for sid, receipt in loaded:
         try:
-            ref = restore_local_session(authority, sid)
-            pending = list_session_admissions(authority.db, session_id=sid)
+            ref = restore_local_session(authority, sid, receipt=receipt)
+            pending = pending_by_sid.get(sid, [])
             if schedule and pending and not any(row['status'] == 'unknown' for row in pending):
                 authority._schedule(ref)
         except (_ReceiptRefused, _CatchUpPending):
             continue  # logged: the check that refused it, or the catch-up handed to a worker
         except RuntimeStoreError as exc:
-            logging.getLogger(__name__).warning('Local session %s paused: %s', sid, exc.reason)
+            _recovery_log.warning('Local session %s paused: %s', sid, exc.reason)
+
+
+def _schedule_rearmed(authority, armed):
+    from gateway.session_runtime_workers import track_mutation
+    from gateway.session_viewer_close import settle_viewer_close
+    pending = pending_admissions_by_session(authority.db, armed)
+    for sid in armed:
+        authority._schedule(SessionRef(authority.profile_id, sid))
+        if any(row['status'] == 'unknown' for row in pending.get(sid, [])):
+            # A hard-killed owner's turn: the drain pauses on it, so the close resolves it.
+            track_mutation(authority, settle_viewer_close(authority, sid))
+
+
+def _rearm_persisted_closes(authority):
+    """A last-viewer close the previous owner stopped before completing (#134889 LC-6b)."""
+    from gateway.session_viewer_close import rearm_persisted_closes
+    armed = rearm_persisted_closes(authority)
+    if armed:
+        _schedule_rearmed(authority, armed)
+    return armed
+
+
+def _log_recovery_progress(done, total, started):
+    if total > _RECOVERY_BATCH:
+        _recovery_log.info(
+            'Local session recovery %d/%d in %.1fs', done, total, time.monotonic() - started)
+
+
+def _log_recovery_finished(total, started):
+    if total:
+        _recovery_log.info(
+            'Local session recovery finished: %d receipt(s) in %.1fs',
+            total, time.monotonic() - started)
+
+
+def recover_local_sessions(authority, *, schedule=False):
+    """Restore every receipt, in ``local_receipt_ids`` order.
+
+    Synchronous: authority bring-up does not yield, so nothing else observes a half-restored
+    registry. Startup and hot-serve use :func:`recover_local_sessions_async`, which yields
+    between batches so the loop answers liveness probes."""
+    started = time.monotonic()
+    ids = local_receipt_ids(authority)
+    total = len(ids)
+    done = 0
+    for chunk in _recovery_batches(ids):
+        loaded, pending = _prefetch_recovery_batch(authority, chunk)
+        _apply_recovery_batch(authority, loaded, pending, schedule=schedule)
+        done += len(chunk)
+        _log_recovery_progress(done, total, started)
     if schedule:
-        # A last-viewer close the previous owner stopped before completing (#134889 LC-6b).
-        from gateway.session_viewer_close import rearm_persisted_closes, settle_viewer_close
-        from gateway.session_runtime_workers import track_mutation
-        for sid in rearm_persisted_closes(authority):
-            authority._schedule(SessionRef(authority.profile_id, sid))
-            if any(row['status'] == 'unknown' for row in list_session_admissions(authority.db, session_id=sid)):
-                # A hard-killed owner's turn: the drain pauses on it, so the close resolves it.
-                track_mutation(authority, settle_viewer_close(authority, sid))
+        _rearm_persisted_closes(authority)
+    _log_recovery_finished(total, started)
+
+
+async def recover_local_sessions_async(authority, *, schedule=False):
+    """:func:`recover_local_sessions` for a live loop.
+
+    Receipt reads run in a worker. Restores stay on this loop — worker threads hold the session
+    store lock across state.db writes, and a restore on the loop is what avoids that inversion —
+    in batches of ``_RECOVERY_BATCH``, yielding between them so a liveness probe's ``call_soon``
+    runs. The caller awaits this before work that needs the restored registry.
+    """
+    started = time.monotonic()
+    ids = await asyncio.to_thread(local_receipt_ids, authority)
+    total = len(ids)
+    done = 0
+    for chunk in _recovery_batches(ids):
+        loaded, pending = await asyncio.to_thread(_prefetch_recovery_batch, authority, chunk)
+        _apply_recovery_batch(authority, loaded, pending, schedule=schedule)
+        done += len(chunk)
+        _log_recovery_progress(done, total, started)
+        if done < total:
+            await asyncio.sleep(0)
+    if schedule:
+        await _rearm_persisted_closes_async(authority)
+    _log_recovery_finished(total, started)
+
+
+async def _rearm_persisted_closes_async(authority):
+    """Same rearm as :func:`_rearm_persisted_closes`, yielding between batches.
+
+    ``rearm_persisted_closes`` writes ``pending_closes`` and stays on this loop.
+    """
+    from gateway.session_viewer_close import rearm_persisted_closes
+    armed = list(rearm_persisted_closes(authority))
+    chunks = list(_recovery_batches(armed))
+    for index, chunk in enumerate(chunks):
+        _schedule_rearmed(authority, chunk)
+        if index + 1 < len(chunks):
+            await asyncio.sleep(0)

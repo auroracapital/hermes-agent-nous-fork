@@ -261,6 +261,42 @@ def local_receipt(db, session_id):
         raise RuntimeStoreError('storage_unavailable') from exc
 
 
+# SQLite's default variable cap is 999. Stay under it so a boot scan of many receipts
+# is one query per chunk, not one query per receipt.
+_RECEIPT_READ_CHUNK = 400
+
+
+def local_receipts(db, session_ids: list[str]) -> dict[str, dict]:
+    """Parsed receipts for *session_ids*, missing and unparsable values omitted.
+
+    One ``state_meta`` query per chunk. Callers that need ``local_receipt``'s refusal
+    for a missing id treat absence here as that refusal and read that id alone.
+    """
+    found: dict[str, dict] = {}
+    ids = [sid for sid in session_ids if isinstance(sid, str) and sid]
+    for start in range(0, len(ids), _RECEIPT_READ_CHUNK):
+        chunk = ids[start:start + _RECEIPT_READ_CHUNK]
+        keys = [POLICY_PREFIX + sid for sid in chunk]
+        placeholders = ",".join("?" * len(keys))
+        with db._read_ctx() as conn:
+            rows = conn.execute(
+                f"SELECT key, value FROM state_meta WHERE key IN ({placeholders})",
+                keys,
+            ).fetchall()
+        by_key = {row[0]: row[1] for row in rows}
+        for sid, key in zip(chunk, keys):
+            raw = by_key.get(key)
+            if raw is None:
+                continue
+            try:
+                value = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                found[sid] = value
+    return found
+
+
 def end_idle_local_session(db, *, epoch, session_id, target_id, reason):
     """Stamp ``ended_at`` on *target_id* only while the logical *session_id*'s FIFO is idle.
 
