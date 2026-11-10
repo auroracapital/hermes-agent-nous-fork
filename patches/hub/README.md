@@ -6,10 +6,11 @@ SQLite read per receipt on the gateway event loop. About 14k open receipts
 made the loop miss three liveness probes (defaults: 30s interval, 10s
 timeout, 3 strikes) and the process exited 75.
 
-`hermes-local-recovery-81a5543.patch` is that fix, cut as
-`git format-patch -1` of `403d2133af` whose parent is `81a55437f3`.
+`hermes-local-recovery-81a5543.patch` is that fix as one squashed
+`git format-patch` against `81a55437f3` (branch
+`lil/gateway-local-recovery-81a5543`).
 
-sha256: `3d3d6f5eec03d3e136b1aa04d7a13de802e38af196373fed40817346148a96c2`
+sha256: `a8fdad53b7b7e5d7cae63d964b581ca9e57d1fb91555e0b2c3dc3feb427270ec`
 
 `git apply --check` of this file against a clean `81a55437f3` checkout exits 0.
 
