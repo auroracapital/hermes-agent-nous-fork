@@ -1,6 +1,7 @@
 name: Canary Release
 
-# Automatic canaries are daily: the schedule caps new tags at one per 24h.
+# Automatic canaries were daily: the schedule capped new tags at one per 24h.
+# The schedule is disabled as of 2026-11-19 (see the on: block below).
 # With no new commits, release.py resumes an existing unpublished canary until
 # its protected head is live; only a published canary makes a quiet day a no-op.
 # workflow_dispatch fires one on demand at any time.
@@ -12,8 +13,10 @@ name: Canary Release
 # conclusion=failure is a canary failure signal.
 
 on:
-  schedule:
-    - cron: "41 6 * * *" # daily, 06:41 UTC
+  # Automatic daily canaries are disabled as of 2026-11-19 (CI cleanup):
+  # 25 of the last 25 scheduled runs failed and this workflow has never been
+  # green. Manual canaries remain available via workflow_dispatch; re-enable
+  # the schedule once the canary pipeline is fixed and has an owner.
   workflow_dispatch:
 
 permissions:
