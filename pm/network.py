@@ -24,6 +24,21 @@ _NETWORK_ERRNOS = frozenset({
 })
 
 
+# DNS failures worth a bounded retry. EAI_AGAIN is the textbook transient
+# code, but resolvers — macOS in particular — also report a transient DNS
+# outage as EAI_NONAME ("nodename nor servname provided"), which is how a
+# one-off resolver hiccup on a GitHub-hosted macOS runner killed an install
+# of the pinned ffmpeg zip (run 44479533556). PM only downloads URLs pinned
+# in the lockfile, so retrying a resolution failure cannot chase a mistyped
+# host anywhere new: a genuinely invalid name still fails, just after the
+# same finite budget every other transient error gets.
+_DNS_RETRY_ERRNOS = frozenset(
+    code
+    for code in (getattr(socket, "EAI_AGAIN", None), getattr(socket, "EAI_NONAME", None))
+    if code is not None
+)
+
+
 def is_transient(exc: Exception) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in _HTTP_RETRY
@@ -34,7 +49,7 @@ def is_transient(exc: Exception) -> bool:
     if isinstance(exc, ssl.SSLError):
         return False
     if isinstance(exc, socket.gaierror):
-        return exc.errno == socket.EAI_AGAIN
+        return exc.errno in _DNS_RETRY_ERRNOS
     if isinstance(exc, (TimeoutError, ConnectionError, http.client.IncompleteRead)):
         return True
     return isinstance(exc, OSError) and exc.errno in _NETWORK_ERRNOS
