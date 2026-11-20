@@ -497,8 +497,16 @@ case "$UPDATE_METHOD" in
     step "driving the app under Playwright: Settings -> About -> Update now"
     # Use the checkout module closure and current driver Node, not OLD tooling.
     rc=0
+    # 20 minutes, not the driver's 10: on shared GitHub-hosted macOS
+    # runners the in-app update (dependency sync + desktop rebuild)
+    # intermittently runs past 10 minutes while still making progress,
+    # and the receipt poll expiring turned those slow-but-healthy
+    # updates red (runs 44258842176, 44380199211, 44479533556; the same
+    # leg is green on the same SHA whenever it finishes in budget).
+    # The 60-minute job timeout still bounds the leg.
     (cd "$WORK_ROOT" && "$HERMES_E2E_NODE" "$ASSETS/launch-from-spec.mjs" \
       --spec "$SPEC" \
+      --timeout-ms 1200000 \
       --old-sha "$OLD_SHA" --chat-out "$LOG_DIR/update-window" --mock-url "$HERMES_E2E_MOCK_URL" \
       --result "$HERMES_HOME/.hermes-update-result.json" \
       --expect-sha "$TARGET_SHA" \

@@ -80,6 +80,25 @@ function gh(args) {
   return execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 }
 
+/**
+ * True when a gh failure is GitHub saying this repository has Issues
+ * disabled (forks ship that way by default). The tracker cannot open or
+ * close anything there; that is a repo setting, not a tracker bug, so
+ * the workflow must degrade to log-only instead of going red itself —
+ * a tracker that fails exactly when the matrix is red trains everyone
+ * to ignore both. Any other gh failure stays a hard error.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isIssuesDisabledError(err) {
+  const e = /** @type {any} */ (err);
+  const haystack = [e?.message, e?.stderr, ...(Array.isArray(e?.output) ? e.output : [])]
+    .filter((part) => typeof part === 'string')
+    .join('\n');
+  return /repository has disabled issues/i.test(haystack);
+}
+
 async function main() {
   const { values } = parseArgs({ options: { 'run-id': { type: 'string' }, 'dry-run': { type: 'boolean', default: false } } });
   const repo = process.env.GITHUB_REPOSITORY;
@@ -98,18 +117,24 @@ async function main() {
     if (plan.body) console.log(`\n--- ${plan.title || 'comment'} ---\n${plan.body}`);
     return;
   }
-  if (plan.action === 'open') {
-    gh(['label', 'create', LABEL, '--repo', repo, '--force', '--color', 'B60205',
-      '--description', 'The scheduled install/update E2E matrix is red (managed by install-e2e-red.yml)']);
-    const url = gh(['issue', 'create', '--repo', repo, '--label', LABEL, '--title', String(plan.title), '--body', String(plan.body)]);
-    console.log(`opened ${url.trim()}`);
-  } else if (plan.action === 'update' && openIssue) {
-    gh(['api', '-X', 'PATCH', `repos/${repo}/issues/${openIssue.number}`, '-f', `title=${plan.title}`, '-f', `body=${plan.body}`]);
-    console.log(`updated #${openIssue.number} in place`);
-  } else if (plan.action === 'close' && openIssue) {
-    gh(['issue', 'comment', String(openIssue.number), '--repo', repo, '--body', String(plan.body)]);
-    gh(['issue', 'close', String(openIssue.number), '--repo', repo]);
-    console.log(`closed #${openIssue.number}`);
+  try {
+    if (plan.action === 'open') {
+      gh(['label', 'create', LABEL, '--repo', repo, '--force', '--color', 'B60205',
+        '--description', 'The scheduled install/update E2E matrix is red (managed by install-e2e-red.yml)']);
+      const url = gh(['issue', 'create', '--repo', repo, '--label', LABEL, '--title', String(plan.title), '--body', String(plan.body)]);
+      console.log(`opened ${url.trim()}`);
+    } else if (plan.action === 'update' && openIssue) {
+      gh(['api', '-X', 'PATCH', `repos/${repo}/issues/${openIssue.number}`, '-f', `title=${plan.title}`, '-f', `body=${plan.body}`]);
+      console.log(`updated #${openIssue.number} in place`);
+    } else if (plan.action === 'close' && openIssue) {
+      gh(['issue', 'comment', String(openIssue.number), '--repo', repo, '--body', String(plan.body)]);
+      gh(['issue', 'close', String(openIssue.number), '--repo', repo]);
+      console.log(`closed #${openIssue.number}`);
+    }
+  } catch (err) {
+    if (!isIssuesDisabledError(err)) throw err;
+    console.warn(`::warning::${repo} has Issues disabled; the tracker cannot ${plan.action} an issue. Enable Issues on the repo to restore tracking. Planned change was:`);
+    console.log(`\n--- ${plan.title || 'comment'} ---\n${plan.body}`);
   }
 }
 

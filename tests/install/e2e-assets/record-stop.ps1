@@ -15,8 +15,8 @@ $ErrorActionPreference = "Stop"
 
 $stateFile = "$OutFile.state"
 if (-not (Test-Path -LiteralPath $stateFile)) {
-    Write-Host "record-stop: no state at $stateFile (was record-start run?)"
-    exit 1
+    Write-Host "record-stop: no state at $stateFile; recording never started, nothing to stop"
+    exit 0
 }
 $state = (Get-Content -LiteralPath $stateFile -Raw).Trim() -split " ", 2
 $holderPid = [int]$state[0]
