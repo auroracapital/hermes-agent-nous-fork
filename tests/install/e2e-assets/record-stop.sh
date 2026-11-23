@@ -5,15 +5,19 @@
 #
 # Graceful stop: the character 'q' on ffmpeg's live stdin (the control
 # fifo). Falls back to SIGINT (also a clean finalize for ffmpeg), then
-# SIGKILL. Fails if the output is missing or has no decodable duration -
-# a zero-frame recording is the classic silent failure.
+# SIGKILL. Fails if a STARTED recording's output is missing or has no
+# decodable duration - a zero-frame recording is the classic silent
+# failure. A missing state file means recording never started (an earlier
+# step, e.g. toolchain setup, already failed and start was skipped): the
+# caller's always() cleanup then has nothing to finalize and must not add
+# a second, phantom failure on top of the real one.
 
 set -euo pipefail
 
 OUT="${1:?usage: record-stop.sh OUTPUT.mkv}"
 STATE="$OUT.state"
 
-[ -f "$STATE" ] || { echo "record-stop: no state at $STATE (was record-start run?)" >&2; exit 1; }
+[ -f "$STATE" ] || { echo "record-stop: no state at $STATE; recording never started, nothing to stop"; exit 0; }
 read -r FFMPEG_PID FIFO _SHEPHERD < "$STATE"
 
 if kill -0 "$FFMPEG_PID" 2>/dev/null; then

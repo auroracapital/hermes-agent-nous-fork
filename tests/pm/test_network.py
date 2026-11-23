@@ -31,7 +31,11 @@ def _http_error(status, retry_after=None):
     pytest.param(http.client.RemoteDisconnected("closed"), True, id="remote-close"),
     pytest.param(http.client.IncompleteRead(b"prefix", 100), True, id="short-read"),
     pytest.param(socket.gaierror(socket.EAI_AGAIN, "temporary"), True, id="temporary-dns"),
-    pytest.param(socket.gaierror(socket.EAI_NONAME, "no name"), False, id="invalid-host"),
+    # macOS resolvers report transient DNS outages as EAI_NONAME, not
+    # EAI_AGAIN; PM's URLs are lockfile-pinned, so a bounded retry is the
+    # right response to either code (a truly invalid name still fails
+    # after the finite budget).
+    pytest.param(socket.gaierror(socket.EAI_NONAME, "no name"), True, id="dns-noname"),
     pytest.param(ssl.SSLEOFError("eof"), True, id="tls-eof"),
     pytest.param(ssl.SSLCertVerificationError("certificate"), False, id="tls-certificate"),
     pytest.param(urllib.error.URLError(ssl.SSLCertVerificationError("certificate")), False, id="wrapped-certificate"),

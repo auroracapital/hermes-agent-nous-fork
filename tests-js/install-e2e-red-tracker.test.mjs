@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest'
-import { planTracker } from '../tests/install/e2e-assets/red-tracker.mjs'
+import { isIssuesDisabledError, planTracker } from '../tests/install/e2e-assets/red-tracker.mjs'
 
 const run = (conclusion) => ({ conclusion, html_url: 'https://example.test/runs/1', head_sha: 'abcdef0123456789', created_at: '2026-09-26T19:24:13Z' })
 const leg = (name, conclusion, step) => ({ name, conclusion, html_url: `https://example.test/job/${name.length}`, steps: step ? [{ name: 'checkout', conclusion: 'success' }, { name: step, conclusion }] : [] })
@@ -22,4 +22,15 @@ test('one tracker: a red run opens it, the next red run rewrites it, a green run
   expect(planTracker(run('failure'), jobs, { number: 7 }).action).toBe('update')
   expect(planTracker(run('success'), [jobs[2]], { number: 7 }).action).toBe('close')
   expect(planTracker(run('success'), [jobs[2]], null).action).toBe('none')
+})
+
+test('issues-disabled is the one gh failure the tracker absorbs', () => {
+  // The exact stderr gh prints for a fork with Issues disabled, as seen
+  // in run 44496939746: execFileSync surfaces it in message and output.
+  const disabled = new Error('Command failed: gh issue create --repo auroracapital/hermes-agent-nous-fork')
+  // @ts-expect-error - shaping the error like execFileSync does
+  disabled.output = [null, '', "the 'auroracapital/hermes-agent-nous-fork' repository has disabled issues\n"]
+  expect(isIssuesDisabledError(disabled)).toBe(true)
+  expect(isIssuesDisabledError(new Error('gh: Not Found (HTTP 404)'))).toBe(false)
+  expect(isIssuesDisabledError(null)).toBe(false)
 })
