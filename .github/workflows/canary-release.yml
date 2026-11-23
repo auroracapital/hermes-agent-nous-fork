@@ -1,7 +1,8 @@
 name: Canary Release
 
 # Automatic canaries were daily: the schedule capped new tags at one per 24h.
-# The schedule is disabled as of 2026-11-19 (see the on: block below).
+# Automatic tagging is disabled as of 2026-11-19 (see the on: block below);
+# the schedule remains only so the prune job keeps cleaning up old canaries.
 # With no new commits, release.py resumes an existing unpublished canary until
 # its protected head is live; only a published canary makes a quiet day a no-op.
 # workflow_dispatch fires one on demand at any time.
@@ -16,7 +17,12 @@ on:
   # Automatic daily canaries are disabled as of 2026-11-19 (CI cleanup):
   # 25 of the last 25 scheduled runs failed and this workflow has never been
   # green. Manual canaries remain available via workflow_dispatch; re-enable
-  # the schedule once the canary pipeline is fixed and has an owner.
+  # automatic tagging once the canary pipeline is fixed and has an owner.
+  # The schedule is retained for the prune job only: the tag job below is
+  # gated to workflow_dispatch, so a scheduled run only prunes canaries
+  # older than 14 days and never tags a new canary.
+  schedule:
+    - cron: "41 6 * * *" # daily, 06:41 UTC
   workflow_dispatch:
 
 permissions:
@@ -32,7 +38,8 @@ jobs:
     name: Tag, draft, and start the canary build
     runs-on: ubuntu-24.04
     # A dispatch from a feature branch would tag unmerged code as the canary.
-    if: github.ref_name == github.event.repository.default_branch
+    # workflow_dispatch only: scheduled runs exist solely to drive prune.
+    if: github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -57,7 +64,9 @@ jobs:
     # Prune even when this run had nothing new to tag. The desktop build
     # runs in its own workflow run, so this does not wait on it — the
     # window is 14 days, far wider than any build.
-    if: always() && needs.tag.result != 'cancelled' && needs.tag.result != 'skipped'
+    # skipped is allowed so a scheduled run (tag gated off) still prunes;
+    # the ref guard keeps a feature-branch dispatch from pruning.
+    if: always() && needs.tag.result != 'cancelled' && github.ref_name == github.event.repository.default_branch
     # Job-level so the R2 prune step can gate on `env` (a step `if` cannot
     # read `secrets`): an unprovisioned release-signing environment skips
     # the R2 prune instead of failing the canary run.
